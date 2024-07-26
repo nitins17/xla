@@ -89,7 +89,7 @@ function get_realpath() {
         demangled_path+=(${mangled//_U/_})
     done
     demangled_path=${demangled_path[@]}
-    echo "bazel-out/darwin-opt/bin/${demangled_path// //}"
+    echo "bazel-out/darwin_arm64-opt/bin/${demangled_path// //}"
 }
 
 # Get the path of a lib inside a tool

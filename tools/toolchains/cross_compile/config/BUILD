@@ -9,9 +9,17 @@ platform(
         "@platforms//cpu:x86_64",
     ],
     exec_properties = {
-        "container-image": "docker://gcr.io/tensorflow-testing/ml-devinfra-linux-aarch64-cross-compile@sha256:06040763c500bd2ebaaa4585d4729c88d2c8ccec94baa7fbe9bbe3dc2827d79d",
+        "container-image": "docker://gcr.io/tensorflow-testing/ml-devinfra-linux-aarch64-cross-compile@sha256:3760fac1156dffd2b5d0469c4e6c2fc436288a7c5205b84492c27daf8aaa2893",
         "OSFamily": "Linux",
     },
+)
+
+platform(
+    name = "darwin_arm64",
+    constraint_values = [
+        "@platforms//os:macos",
+        "@platforms//cpu:arm64",
+    ],
 )
 
 platform(
@@ -41,5 +49,19 @@ toolchain(
         "@platforms//cpu:x86_64",
     ],
     toolchain = "//tools/toolchains/cross_compile/cc:macos_x86_toolchain",
+    toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",
+)
+
+toolchain(
+    name = "macos-arm64-cross-compile-cc-toolchain",
+    exec_compatible_with = [
+        "@platforms//os:linux",
+        "@platforms//cpu:x86_64",
+    ],
+    target_compatible_with = [
+        "@platforms//os:macos",
+        "@platforms//cpu:arm64",
+    ],
+    toolchain = "//tools/toolchains/cross_compile/cc:macos_arm64_toolchain",
     toolchain_type = "@bazel_tools//tools/cpp:toolchain_type",
 )
