@@ -1,10 +1,10 @@
-load("@tsl//tsl/platform:rules_cc.bzl", "cc_library")
-load("@tsl//tsl/profiler/builds:build_config.bzl", "tf_profiler_copts")
 load(
-    "//xla:xla.bzl",
+    "//xla:xla.default.bzl",
     "xla_cc_test",
 )
 load("//xla/tsl:tsl.bzl", "internal_visibility")
+load("//xla/tsl/platform:rules_cc.bzl", "cc_library")
+load("//xla/tsl/profiler/builds:build_config.bzl", "tf_profiler_copts")
 
 # copybara:uncomment package(default_applicable_licenses = ["//tensorflow:license"])
 
@@ -33,18 +33,17 @@ cc_library(
         # copybara:uncomment "//tensorflow/core/profiler:internal",
     ]),
     deps = [
+        "//xla/tsl/profiler/backends/cpu:host_tracer_utils",
+        "//xla/tsl/profiler/backends/cpu:threadpool_listener",
+        "//xla/tsl/profiler/backends/cpu:traceme_recorder",
+        "//xla/tsl/profiler/utils:time_utils",
+        "//xla/tsl/profiler/utils:xplane_schema",
+        "//xla/tsl/profiler/utils:xplane_utils",
         "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
-        "@tsl//tsl/platform:errors",
-        "@tsl//tsl/profiler/backends/cpu:host_tracer_utils",
-        "@tsl//tsl/profiler/backends/cpu:threadpool_listener",
-        "@tsl//tsl/profiler/backends/cpu:traceme_recorder",
         "@tsl//tsl/profiler/lib:profiler_collection",
         "@tsl//tsl/profiler/lib:profiler_interface",
         "@tsl//tsl/profiler/protobuf:xplane_proto_cc",
-        "@tsl//tsl/profiler/utils:time_utils",
-        "@tsl//tsl/profiler/utils:xplane_schema",
-        "@tsl//tsl/profiler/utils:xplane_utils",
     ],
 )
 
@@ -76,9 +75,9 @@ cc_library(
     ]),
     deps = [
         "//xla/python/profiler/internal:python_hooks",
+        "//xla/tsl/platform:logging",
+        "@com_google_absl//absl/log",
         "@com_google_absl//absl/status",
-        "@tsl//tsl/platform:errors",
-        "@tsl//tsl/platform:logging",
         "@tsl//tsl/profiler/lib:profiler_interface",
         "@tsl//tsl/profiler/protobuf:xplane_proto_cc",
     ],
@@ -96,14 +95,14 @@ cc_library(
         ":metadata_utils",
         "//xla/service:hlo_proto_cc",
         "//xla/service:xla_debug_info_manager",
+        "//xla/tsl/profiler/utils:xplane_builder",
+        "//xla/tsl/profiler/utils:xplane_schema",
+        "//xla/tsl/profiler/utils:xplane_utils",
         "@com_google_absl//absl/status",
         "@tsl//tsl/profiler/lib:profiler_factory",
         "@tsl//tsl/profiler/lib:profiler_interface",
         "@tsl//tsl/profiler/protobuf:profiler_options_proto_cc",
         "@tsl//tsl/profiler/protobuf:xplane_proto_cc",
-        "@tsl//tsl/profiler/utils:xplane_builder",
-        "@tsl//tsl/profiler/utils:xplane_schema",
-        "@tsl//tsl/profiler/utils:xplane_utils",
     ],
     alwayslink = True,
 )
@@ -116,10 +115,10 @@ cc_library(
     ]),
     deps = [
         "//xla/service:hlo_proto_cc",
-        "@tsl//tsl/profiler/convert:xla_op_utils",
+        "//xla/tsl/profiler/convert:xla_op_utils",
+        "//xla/tsl/profiler/utils:xplane_builder",
+        "//xla/tsl/profiler/utils:xplane_schema",
         "@tsl//tsl/profiler/protobuf:xplane_proto_cc",
-        "@tsl//tsl/profiler/utils:xplane_builder",
-        "@tsl//tsl/profiler/utils:xplane_schema",
     ],
 )
 
@@ -128,19 +127,18 @@ xla_cc_test(
     srcs = ["host_tracer_test.cc"],
     deps = [
         ":host_tracer_impl",
-        "@com_google_absl//absl/types:optional",
+        "//xla/tsl/lib/core:status_test_util",
+        "//xla/tsl/platform:env",
+        "//xla/tsl/platform:test",
+        "//xla/tsl/platform:types",
+        "//xla/tsl/profiler/utils:tf_xplane_visitor",
+        "//xla/tsl/profiler/utils:timespan",
+        "//xla/tsl/profiler/utils:xplane_schema",
+        "//xla/tsl/profiler/utils:xplane_visitor",
+        "@com_google_absl//absl/synchronization",
         "@com_google_googletest//:gtest_main",
-        "@tsl//tsl/lib/core:status_test_util",
-        "@tsl//tsl/platform:blocking_counter",
-        "@tsl//tsl/platform:env",
-        "@tsl//tsl/platform:test",
-        "@tsl//tsl/platform:types",
         "@tsl//tsl/profiler/lib:profiler_interface",
         "@tsl//tsl/profiler/lib:traceme",
         "@tsl//tsl/profiler/protobuf:xplane_proto_cc",
-        "@tsl//tsl/profiler/utils:tf_xplane_visitor",
-        "@tsl//tsl/profiler/utils:timespan",
-        "@tsl//tsl/profiler/utils:xplane_schema",
-        "@tsl//tsl/profiler/utils:xplane_visitor",
     ],
 )

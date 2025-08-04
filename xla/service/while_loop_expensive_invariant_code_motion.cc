@@ -15,6 +15,7 @@ limitations under the License.
 
 #include "xla/service/while_loop_expensive_invariant_code_motion.h"
 
+#include <cstdint>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -23,7 +24,11 @@ limitations under the License.
 #include "absl/container/flat_hash_map.h"
 #include "absl/container/flat_hash_set.h"
 #include "absl/container/inlined_vector.h"
-#include "xla/service/while_loop_analysis.h"
+#include "absl/log/check.h"
+#include "absl/log/log.h"
+#include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
+#include "xla/hlo/analysis/while_loop_analysis.h"
 #include "xla/service/while_util.h"
 #include "xla/shape_util.h"
 #include "xla/util.h"
@@ -225,7 +230,7 @@ absl::StatusOr<bool> WhileLoopExpensiveInvariantCodeMotion::
         instruction, InvariantInfo(/*user_count=*/instruction->user_count()));
     CHECK(emplace_result.second);
     InvariantInfo& instr_info = emplace_result.first->second;
-    // If root is a users of it, substract 1 from remaining user count as we
+    // If root is a users of it, subtract 1 from remaining user count as we
     // don't want root to be blocking other users from being hoisted. Note that
     // for invariant parameter GTEs, they will skip the iteration because their
     // operand parameter(0) is not invariant, and they are put into
@@ -350,6 +355,11 @@ absl::StatusOr<bool> WhileLoopExpensiveInvariantCodeMotion::Run(
                     HloPredicateIsOp<HloOpcode::kWhile>);
   }
 
+  // Currently, if a loop body that is used by multiple while
+  // ops contains an op that can be hoisted, we will make a new computation for
+  // each of the while ops, instead of using one shared new computation. This is
+  // probably fine, but we may want to improve it in the future if we decide to
+  // double-down on shared while bodies.
   for (HloInstruction* while_instr : while_instrs) {
     // Right now we only hoist computations from the while body, but
     // TryHoistingInvariantInstructionsFromWhileBody can be generalized to

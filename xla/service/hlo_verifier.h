@@ -16,14 +16,20 @@ limitations under the License.
 #ifndef XLA_SERVICE_HLO_VERIFIER_H_
 #define XLA_SERVICE_HLO_VERIFIER_H_
 
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
 #include <utility>
 
+#include "absl/container/flat_hash_set.h"
+#include "absl/log/check.h"
+#include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/string_view.h"
 #include "xla/hlo/ir/dfs_hlo_visitor_with_default.h"
-#include "xla/service/hlo_pass_interface.h"
+#include "xla/hlo/pass/hlo_pass_interface.h"
+#include "xla/xla_data.pb.h"
 
 namespace xla {
 
@@ -61,8 +67,8 @@ struct HloVerifierOpts {
     return std::move(*this);
   }
 
-  HloVerifierOpts&& VerifyCustomCallNestedComputationThreadName() {
-    verify_custom_call_nested_computation_thread_name = true;
+  HloVerifierOpts&& VerifyCallNestedComputationThreadName() {
+    verify_call_nested_computation_thread_name = true;
     return std::move(*this);
   }
 
@@ -101,7 +107,22 @@ struct HloVerifierOpts {
     return std::move(*this);
   }
 
+  HloVerifierOpts&& VerifyNoHostMemorySpace() {
+    verify_no_host_memory_space = true;
+    return std::move(*this);
+  }
+
+  HloVerifierOpts&& WithVerifyNoCollectiveDeadlocks(
+      bool verify_no_collective_deadlocks_p) {
+    verify_no_collective_deadlocks = verify_no_collective_deadlocks_p;
+    return std::move(*this);
+  }
+
   bool IsLayoutSensitive() const { return layout_sensitive; }
+
+  bool CheckForCollectiveDeadlocks() const {
+    return verify_no_collective_deadlocks;
+  }
 
   bool AllowMixedPrecision() const { return allow_mixed_precision; }
 
@@ -131,9 +152,8 @@ struct HloVerifierOpts {
   // Check that reshape is a physical bitcast.
   bool verify_reshape_is_bitcast = false;
 
-  // Check that custom call's called computations have same thread name as
-  // parent computation.
-  bool verify_custom_call_nested_computation_thread_name = true;
+  // Check that called computations have same thread name as parent computation.
+  bool verify_call_nested_computation_thread_name = false;
 
   // Check device numbers in sharding verification.
   bool verify_sharding_device_numbers = true;
@@ -148,6 +168,15 @@ struct HloVerifierOpts {
   // Should enforce no function renames unless the name instruction has been
   // cloned (".clone" suffix) or rematted (".remat");
   bool verify_instruction_name_unchanged = false;
+
+  // Check if channel instructions all have unique channel ids.
+  bool verify_unique_channel_ids = true;
+
+  // Check if a shape has a host memory space color
+  bool verify_no_host_memory_space = false;
+
+  // Check if collectives in the given module will result in a deadlock.
+  bool verify_no_collective_deadlocks = false;
 
   HloPredicate instruction_can_change_layout;
 
@@ -191,11 +220,13 @@ class ShapeVerifier : public DfsHloVisitor {
   absl::Status HandleAllReduceStart(HloInstruction* hlo) override;
   absl::Status HandleAllReduceDone(HloInstruction* hlo) override;
   absl::Status HandleAllToAll(HloInstruction* hlo) override;
+  absl::Status HandleRaggedAllToAll(HloInstruction* hlo) override;
   absl::Status HandleCollectiveBroadcast(HloInstruction* hlo) override;
   absl::Status HandleCollectivePermute(HloInstruction* hlo) override;
   absl::Status HandleCollectivePermuteStart(HloInstruction* hlo) override;
   absl::Status HandleCollectivePermuteDone(HloInstruction* hlo) override;
   absl::Status HandlePartitionId(HloInstruction* hlo) override;
+  absl::Status HandleRaggedDot(HloInstruction* ragged_dot) override;
   absl::Status HandleReplicaId(HloInstruction* hlo) override;
   absl::Status HandleReducePrecision(HloInstruction* reduce_precision) override;
   absl::Status HandleInfeed(HloInstruction*) override;
@@ -366,13 +397,16 @@ class HloVerifier : public HloModulePass {
       bool layout_sensitive, bool allow_mixed_precision,
       HloPredicate instruction_can_change_layout_func = {},
       std::function<int64_t(const Shape&)> shape_size_func =
-          [](const Shape& shape) { return ShapeUtil::ByteSizeOf(shape); })
+          [](const Shape& shape) { return ShapeUtil::ByteSizeOf(shape); },
+      bool verify_no_collective_deadlocks = false)
       : HloVerifier(HloVerifierOpts{}
                         .WithLayoutSensitive(layout_sensitive)
                         .WithAllowMixedPrecision(allow_mixed_precision)
                         .WithInstructionCanChangeLayout(
                             instruction_can_change_layout_func)
-                        .WithCustomShapeSize(shape_size_func)) {}
+                        .WithCustomShapeSize(shape_size_func)
+                        .WithVerifyNoCollectiveDeadlocks(
+                            verify_no_collective_deadlocks)) {}
 
   explicit HloVerifier(HloVerifierOpts&& opts)
       : target_metadata_(

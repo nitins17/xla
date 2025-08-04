@@ -13,20 +13,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-#if defined(INTEL_MKL) && defined(ENABLE_ONEDNN_V3)
+#if defined(INTEL_MKL)
 
+#include <string>
 #include <utility>
 
+#include "absl/strings/str_replace.h"
+#include "xla/hlo/testlib/filecheck.h"
+#include "xla/hlo/testlib/test.h"
+#include "xla/hlo/testlib/test_helpers.h"
 #include "xla/hlo/utils/hlo_matchers.h"
 #include "xla/literal.h"
-#include "xla/service/cpu/onednn_matmul_rewriter.h"
+#include "xla/service/cpu/onednn_contraction_rewriter.h"
 #include "xla/service/cpu/onednn_util.h"
 #include "xla/shape_util.h"
-#include "xla/test.h"
-#include "xla/test_helpers.h"
-#include "xla/tests/filecheck.h"
 #include "xla/tests/hlo_test_base.h"
-#include "xla/tests/test_macros.h"
 #include "tsl/platform/cpu_info.h"
 
 namespace op = xla::testing::opcode_matchers;
@@ -36,6 +37,12 @@ namespace cpu {
 
 class MatmulTest : public HloTestBase {
  protected:
+  DebugOptions GetDebugOptionsForTest() const override {
+    DebugOptions debug_options = HloTestBase::GetDebugOptionsForTest();
+    debug_options.set_xla_cpu_use_thunk_runtime(false);
+    return debug_options;
+  }
+
   const char* fused_matmul_bias_ = R"(
     ; CHECK:     custom_call_target="__onednn$matmul",
     ; CHECK:       backend_config={
@@ -54,6 +61,17 @@ class MatmulTest : public HloTestBase {
     ; CHECK-DAG:     "onednn_matmul_config":{
     ; CHECK-DAG:       "fusions":{
     ; CHECK-DAG:         "ops":["BINARY_ADD"]
+    ; CHECK-DAG:     }
+    ; CHECK-DAG:   }
+    ; CHECK:     }
+    )";
+  const char* fused_matmul_sum_ = R"(
+    ; CHECK:     custom_call_target="__onednn$matmul",
+    ; CHECK:       backend_config={
+    ; CHECK-DAG:     "outer_dimension_partitions":[],
+    ; CHECK-DAG:     "onednn_matmul_config":{
+    ; CHECK-DAG:       "fusions":{
+    ; CHECK-DAG:         "ops":["SUM"]
     ; CHECK-DAG:     }
     ; CHECK-DAG:   }
     ; CHECK:     }
@@ -131,6 +149,30 @@ class MatmulTest : public HloTestBase {
     ; CHECK-DAG:     }
     ; CHECK:     }
     )";
+  const char* fused_matmul_bias_add_str_ = R"(
+    ; CHECK:     custom_call_target="__onednn$matmul",
+    ; CHECK:       backend_config={
+    ; CHECK-DAG:     "outer_dimension_partitions":[],
+    ; CHECK-DAG:     "onednn_matmul_config":{
+    ; CHECK-DAG:       "fusions":{
+    ; CHECK-DAG:         "ops":["BIAS","BINARY_ADD"]
+    ; CHECK-DAG:   }
+    ; CHECK:     }
+    )";
+  const char* fused_matmul_bias_add_sum_str_ = R"(
+    ; CHECK:     custom_call_target="__onednn$matmul",
+    ; CHECK:       backend_config={
+    ; CHECK-DAG:     "outer_dimension_partitions":[],
+    ; CHECK-DAG:     "onednn_matmul_config":{
+    ; CHECK-DAG:       "fusions":{
+    ; CHECK-DAG:         "ops":["BIAS","SUM"]
+    ; CHECK-DAG:   }
+    ; CHECK:     }
+    )";
+  const char* matmul_transpose_rewrite_str_ = R"(
+    ; CHECK-NOT: transpose(%{{[a-z,A-Z,0-9,_,\.]*}}),
+    ; CHECK:     custom_call_target="__onednn$matmul",
+    )";
 };
 
 TEST_F(MatmulTest, SimpleTestF32) {
@@ -164,6 +206,10 @@ TEST_F(MatmulTest, SimpleTestBF16) {
   })";
 
   EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-2, 1e-4}));
+  // For BF16, we match the optimized HLO with HLO containing
+  // BINARY_ADD instead of SUM as SUM post-op does not work for
+  // BF16 because element-wise addition is not allowed due to
+  // precision constraints by oneDNN.
   MatchOptimizedHlo(matmul_module_str, matmul_rewrite_str_);
 }
 
@@ -225,7 +271,7 @@ TEST_F(MatmulTest, SimpleTestF32WithBiasAddFusion1) {
 TEST_F(MatmulTest, SimpleTestF32WithBiasAddFusion2) {
   const char* matmul_module_str = R"(
   HloModule matmul.biasadd.test.f32
-  
+
   ENTRY matmul.biasadd.test.f32 {
     arg0.1 = f32[400,300] parameter(0), parameter_replication={false}
     reshape.2 = f32[400,300] reshape(arg0.1)
@@ -261,7 +307,51 @@ TEST_F(MatmulTest, SimpleTestF32WithBiasAsParameter1) {
   })";
 
   EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-4, 1e-4}));
-  MatchOptimizedHlo(matmul_module_str, fused_matmul_binary_add_);
+  MatchOptimizedHlo(matmul_module_str, fused_matmul_sum_);
+}
+
+TEST_F(MatmulTest, SimpleTestF32Add2Dots) {
+  const char* matmul_module_str = R"(
+  HloModule matmul.biasadd.test.f32
+
+  ENTRY matmul.biasadd.test.f32 {
+    arg0.1 = f32[32,32,40,30] parameter(0)
+    arg0.2 = f32[32,32,30,40] parameter(1)
+    arg0.3 = f32[32,32,40,40] parameter(2)
+    arg0.4 = f32[32,32,40,40] parameter(3)
+    dot.7 = f32[32,32,40,40] dot(arg0.1, arg0.2), lhs_batch_dims={0,1},
+       lhs_contracting_dims={3}, rhs_batch_dims={0,1}, rhs_contracting_dims={2}
+    dot.8 = f32[32,32,40,40] dot(arg0.3, arg0.4), lhs_batch_dims={0,1},
+       lhs_contracting_dims={3}, rhs_batch_dims={0,1}, rhs_contracting_dims={2}
+    ROOT add.10 = f32[32,32,40,40] add(dot.7, dot.8)
+  })";
+
+  EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-4, 1e-4}));
+  MatchOptimizedHlo(matmul_module_str, fused_matmul_sum_);
+}
+
+TEST_F(MatmulTest, SimpleTestF16Add2Dots) {
+  if (!IsSupportedType(PrimitiveType::F16)) {
+    GTEST_SKIP() << "CPU does not support F16.";
+  }
+
+  const char* matmul_module_str = R"(
+  HloModule matmul.biasadd.test.f16
+
+  ENTRY matmul.biasadd.test.f16 {
+    arg0.1 = f16[32,64,128] parameter(0)
+    arg0.2 = f16[32,128,64] parameter(1)
+    arg0.3 = f16[32,64,64] parameter(2)
+    arg0.4 = f16[32,64,64] parameter(3)
+    dot.7 = f16[32,64,64] dot(arg0.1, arg0.2), lhs_batch_dims={0},
+        lhs_contracting_dims={2}, rhs_batch_dims={0}, rhs_contracting_dims={1}
+    dot.8 = f16[32,64,64] dot(arg0.3, arg0.4), lhs_batch_dims={0},
+        lhs_contracting_dims={2}, rhs_batch_dims={0}, rhs_contracting_dims={1}
+    ROOT add.10 = f16[32,64,64] add(dot.7, dot.8)
+  })";
+
+  EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-2, 1e-2}));
+  MatchOptimizedHlo(matmul_module_str, fused_matmul_sum_);
 }
 
 TEST_F(MatmulTest, SimpleTestF32WithBiasAsParameter2) {
@@ -797,7 +887,9 @@ TEST_F(MatmulTest, TestNonScalarConstantEltwiseLinearF32) {
   ; CHECK:       backend_config={
   ; CHECK-DAG:     "outer_dimension_partitions":[],
   ; CHECK-DAG:     "onednn_matmul_config":{
-  ; CHECK-NOT:       "fused_ops":["LINEAR"]
+  ; CHECK-NOT:       "fusions":{
+  ; CHECK-NOT:         "ops":["LINEAR"]
+  ; CHECK-NOT:     }
   ; CHECK-DAG:   }
   ; CHECK:     }
   )");
@@ -991,9 +1083,9 @@ TEST_F(MatmulTest, TestF32ConstantWeights) {
   HloModule matmul.test.f32
 
   ENTRY matmul.test.f32 {
-    arg.0 = f32[64,256,16] parameter(0), parameter_replication={false}
-    constant = f32[] constant(1)
-    arg.1 = f32[16,32] broadcast(constant), dimensions={}
+    arg.0 = f32[64,256,16] parameter(0)
+    constant = f32[32] constant({...})
+    arg.1 = f32[16,32] broadcast(constant), dimensions={1}
     ROOT onednn.matmul.0 = f32[64,256,32] dot(arg.0, arg.1), lhs_contracting_dims={2}, rhs_contracting_dims={0}
   })";
 
@@ -1128,7 +1220,7 @@ TEST_F(MatmulTest, SIGMOIDTestF32) {
       const.0 = f32[32]{0} constant(5)
       bcast.0 = f32[32,32,4,32] broadcast(const.0), dimensions={3}
       add.0 = f32[32,32,4,32] add(onednn.matmul.0, bcast.0)
-      
+
       const.1 = f32[] constant(1)
       bcast.1 = f32[32,32,4,32] broadcast(const.1), dimensions={}
       negate.0 = f32[32,32,4,32] negate(add.0)
@@ -1149,7 +1241,7 @@ TEST_F(MatmulTest, SIGMOIDTestBF16) {
   }
   const char* matmul_module_str = R"(
     HloModule matmul.bias.sigmoid.test.bf16
-                                                                      
+
     ENTRY matmul.bias.sigmoid.test.bf16 {
       arg.0 = f32[32,32,4,16] parameter(0), parameter_replication={false}
       convert.0 = bf16[32,32,4,16] convert(arg.0)
@@ -1180,7 +1272,7 @@ TEST_F(MatmulTest, SIGMOIDTestF16) {
   }
   const char* matmul_module_str = R"(
     HloModule matmul.bias.sigmoid.test.f16
-                                                                      
+
     ENTRY matmul.bias.sigmoid.test.f16 {
       arg.0 = f32[32,32,4,16] parameter(0), parameter_replication={false}
       convert.0 = f16[32,32,4,16] convert(arg.0)
@@ -1230,7 +1322,7 @@ TEST_F(MatmulTest, SimpleTestBF16Gemv2) {
 
   const char* matmul_module_str = R"(
   HloModule matmul.test.bf16
-  
+
   ENTRY matmul.test.bf16 {
     arg.0 = bf16[100,300,300] parameter(0)
     arg.1 = bf16[300] parameter(1)
@@ -1469,6 +1561,62 @@ TEST_F(MatmulTest, SimpleTestBF16WithMulAndAddFusion) {
     )");
 }
 
+std::string CreateTransposeFusionModuleText(std::string dtype) {
+  const char* matmul_module_str = R"(
+  ENTRY matmul.test {
+    arg0.1 = DTYPE[32,40,30,64] parameter(0), parameter_replication={false}
+    transpose.1 = DTYPE[32,30,40,64]{3,1,2,0} transpose(arg0.1), dimensions={0,2,1,3}
+    copy.1 = DTYPE[32,30,40,64]{3,2,1,0} copy(transpose.1)
+    arg0.2 = DTYPE[32,40,30,64]{3,2,1,0} parameter(1), parameter_replication={false}
+    transpose.2 = DTYPE[32,30,40,64]{3,1,2,0} transpose(arg0.2), dimensions={0,2,1,3}
+    copy.2 = DTYPE[32,30,40,64]{3,2,1,0} copy(transpose.2)
+    ROOT dot.201 = DTYPE[32,30,40,40]{3,2,1,0} dot(copy.1, copy.2), lhs_batch_dims={0,1}, lhs_contracting_dims={3}, rhs_batch_dims={0,1}, rhs_contracting_dims={3}
+  })";
+  return absl::StrReplaceAll(matmul_module_str, {{"DTYPE", dtype}});
+}
+
+TEST_F(MatmulTest, SimpleTestTransposeFusionF32) {
+  const std::string matmul_module_str = CreateTransposeFusionModuleText("f32");
+  EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-4, 1e-4}));
+  MatchOptimizedHlo(matmul_module_str, matmul_transpose_rewrite_str_);
+}
+
+TEST_F(MatmulTest, SimpleTestTransposeFusionBF16) {
+  if (!IsSupportedType(PrimitiveType::BF16)) {
+    GTEST_SKIP() << "CPU does not support BF16.";
+  }
+  const std::string matmul_module_str = CreateTransposeFusionModuleText("bf16");
+  EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-2, 1e-2}));
+  MatchOptimizedHlo(matmul_module_str, matmul_transpose_rewrite_str_);
+}
+
+TEST_F(MatmulTest, SimpleTestTransposeFusionF16) {
+  if (!IsSupportedType(PrimitiveType::F16)) {
+    GTEST_SKIP() << "CPU does not support F16.";
+  }
+  const std::string matmul_module_str = CreateTransposeFusionModuleText("f16");
+  EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-2, 1e-2}));
+  MatchOptimizedHlo(matmul_module_str, matmul_transpose_rewrite_str_);
+}
+
+TEST_F(MatmulTest, SimpleTestNoTransposeFusion) {
+  const char* matmul_module_str = R"(
+  ENTRY matmul.test {
+    arg0.1 = f32[32,40,40,32] parameter(0), parameter_replication={false}
+    arg0.2 = f32[32,40,40,32] parameter(1), parameter_replication={false}
+    transpose.2 = f32[32,40,40,32] transpose(arg0.2), dimensions={3,2,1,0}
+    copy.2 = f32[32,40,40,32] copy(transpose.2)
+    ROOT dot.201 = f32[32,40,40,40] dot(arg0.1, copy.2), lhs_batch_dims={0,1}, lhs_contracting_dims={3}, rhs_batch_dims={0,1}, rhs_contracting_dims={3}
+  })";
+
+  EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-4, 1e-4}));
+  MatchOptimizedHlo(matmul_module_str,
+                    R"(
+    ; CHECK:     transpose(%{{[a-z,A-Z,0-9,_,\.]*}}),
+    ; CHECK:     custom_call_target="__onednn$matmul",
+    )");
+}
+
 TEST_F(MatmulTest, WeightsPrepackAndScratch) {
   const char* matmul_module_str = R"(
   HloModule matmul.test.f32
@@ -1493,47 +1641,44 @@ TEST_F(MatmulTest, WeightsPrepackAndScratch) {
   )");
 }
 
+TEST_F(MatmulTest, ColMajorBF16DotBeforeLayoutAssignment) {
+  if (!IsSupportedType(PrimitiveType::BF16)) {
+    GTEST_SKIP() << "CPU does not support BF16.";
+  }
+
+  const char* matmul_module_str = R"(
+  HloModule matmul.colmajor.test
+  ENTRY matmul.colmajor.test.bf16 {
+    arg.0 = bf16[500,500]{0,1} parameter(0)
+    arg.1 = bf16[500,500]{1,0} parameter(1)
+    transpose.0 = bf16[500,500]{0,1} transpose(arg.1), dimensions={1,0}
+    ROOT dot.0 = bf16[500,500]{1,0} dot(arg.0, arg.1), lhs_contracting_dims={1},
+      rhs_contracting_dims={0}
+  })";
+
+  EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec(1e-2, 1e-2)));
+  MatchOptimizedHlo(matmul_module_str,
+                    R"(
+  ; CHECK: (bf16[500,500]{1,0}, u8[{{.*}}]{0})
+  ; CHECK-SAME: custom_call_target="__onednn$matmul"
+  )");
+}
+
 TEST_F(MatmulTest, ConsecutiveBinaryAdd) {
   const char* matmul_module_str = R"(
   HloModule matmul.test.f32
-    region_0.22 {
-    Arg_0.23 = f32[] parameter(0)
-    Arg_1.24 = f32[] parameter(1)
-  ROOT add.25 = f32[] add(Arg_0.23, Arg_1.24)
-  }
-
-  region_1.29 {
-    Arg_0.30 = f32[] parameter(0)
-    Arg_1.31 = f32[] parameter(1)
-    ROOT add.32 = f32[] add(Arg_0.30, Arg_1.31)
-  }
-
-  ENTRY main {
-    constant.2 = f32[] constant(1e-06)
-    broadcast.3 = f32[1000000] broadcast(constant.2), dimensions={}
-    constant.7 = f32[] constant(1)
-    broadcast.8 = f32[1000000,3] broadcast(constant.7), dimensions={}
-    Arg_0.1 = f32[3] parameter(0)
-    reshape.10 = f32[1,3] reshape(Arg_0.1)
-    broadcast.11 = f32[1,3] broadcast(reshape.10), dimensions={0,1}
-    reshape.12 = f32[3] reshape(broadcast.11)
-    broadcast.13 = f32[1000000,3] broadcast(reshape.12), dimensions={1}
-    subtract.14 = f32[1000000,3] subtract(broadcast.8, broadcast.13)
-    constant.4 = f32[] constant(0)
-    broadcast.5 = f32[3,3] broadcast(constant.4), dimensions={}
-    dot.15 = f32[1000000,3] dot(subtract.14, broadcast.5), lhs_contracting_dims={1}, rhs_contracting_dims={0}
-    dot.16 = f32[1000000,3] dot(broadcast.3, dot.15), lhs_batch_dims={0}, lhs_contracting_dims={}, rhs_batch_dims={0}, rhs_contracting_dims={}
-    dot.17 = f32[1000000,3] dot(broadcast.3, subtract.14), lhs_batch_dims={0}, lhs_contracting_dims={}, rhs_batch_dims={0}, rhs_contracting_dims={}
-    dot.18 = f32[1000000,3] dot(dot.17, broadcast.5), lhs_contracting_dims={1}, rhs_contracting_dims={1}
-    add.19 = f32[1000000,3] add(dot.16, dot.18)
-    constant.9 = f32[3] constant({1, 2, 3})
-    dot.20 = f32[1000000,3] dot(broadcast.3, constant.9), lhs_contracting_dims={}, rhs_contracting_dims={}
-    add.21 = f32[1000000,3] add(add.19, dot.20)
-    constant.6 = f32[] constant(0)
-    reduce.26 = f32[3] reduce(add.21, constant.6), dimensions={0}, to_apply=region_0.22
-    reshape.27 = f32[1,3] reshape(reduce.26)
-    negate.28 = f32[1,3] negate(reshape.27)
-    ROOT reduce.33 = f32[3] reduce(negate.28, constant.6), dimensions={0}, to_apply=region_1.29
+  ENTRY matmul.test.f32 {
+    arg0.1 = f32[128,32,4,4] parameter(0)
+    arg0.2 = f32[128,32,4,4] parameter(1)
+    dot.7 = f32[128,32,4,4] dot(arg0.1, arg0.2), lhs_batch_dims={0,1}, lhs_contracting_dims={3}, rhs_batch_dims={0,1}, rhs_contracting_dims={2}
+    const.0 = f32[128,32] constant({...})
+    bcast.1 = f32[128,32,4,4] broadcast(const.0), dimensions={0,1}
+    add.0 = f32[128,32,4,4] add(dot.7,bcast.1)
+    const.1 = f32[4] constant({1,2,3,4})
+    bcast.2 = f32[128,32,4,4] broadcast(const.1), dimensions={3}
+    add.1 = f32[128,32,4,4] add(add.0, bcast.2)
+    tuple.12 = (f32[128,32,4,4]) tuple(add.1)
+    ROOT get-tuple-element.13 = f32[128,32,4,4] get-tuple-element(tuple.12), index=0
   })";
 
   EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-4, 1e-4}));
@@ -1541,7 +1686,7 @@ TEST_F(MatmulTest, ConsecutiveBinaryAdd) {
 
 TEST_F(MatmulTest, BroadcastedAddAfterFusion) {
   const char* matmul_module_str = R"(
-  HloModule matmul.nonscalar.test.1
+  HloModule matmul.nonscalar.test
   ENTRY matmul.nonscalar.test.f32 {
     arg.0 = f32[16,400,500] parameter(0)
     arg.1 = f32[16,500,3] parameter(1)
@@ -1569,7 +1714,147 @@ TEST_F(MatmulTest, BroadcastedAddAfterFusion) {
   )");
 }
 
+TEST_F(MatmulTest, SimpleTestF32BiasAndSwish) {
+  const char* matmul_module_str = R"(
+  ENTRY matmul.add.swish.test.f32 {
+    arg.0 = f32[128,512] parameter(0)
+    arg.1 = f32[256,512] parameter(1)
+    constant.1 = f32[] constant(1)
+    broadcast.1 = f32[128,256] broadcast(constant.1), dimensions={}
+    dot.0 = f32[128,256] dot(arg.0, arg.1), lhs_contracting_dims={1}, rhs_contracting_dims={1}
+    constant.0 = f32[256]{0} constant({...})
+    broadcast.0 = f32[128,256] broadcast(constant.0), dimensions={1}
+    add.0 = f32[128,256] add(dot.0, broadcast.0)
+    negate.0 = f32[128,256] negate(add.0)
+    exponential.0 = f32[128,256] exponential(negate.0)
+    add.1 = f32[128,256] add(broadcast.1, exponential.0)
+    divide.0 = f32[128,256] divide(broadcast.1, add.1)
+    ROOT multiply.0 = f32[128,256] multiply(divide.0, add.0)
+})";
+
+  EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-4, 1e-4}));
+  MatchOptimizedHlo(matmul_module_str,
+                    R"(
+    ; CHECK:     custom_call_target="__onednn$matmul",
+    ; CHECK:       backend_config={
+    ; CHECK-DAG:     "outer_dimension_partitions":[],
+    ; CHECK-DAG:     "onednn_matmul_config":{
+    ; CHECK-DAG:       "fusions":{
+    ; CHECK-DAG:         "ops":["BIAS","SWISH"]
+    ; CHECK-DAG:     }
+    ; CHECK-DAG:   }
+    ; CHECK:     }
+    )");
+}
+
+std::string CreateMatmulBiasAddAndAddModuleText(std::string dtype1,
+                                                std::string dtype2) {
+  const std::string matmul_module_str = R"(
+  HloModule matmul.bias.add.test
+  ENTRY matmul.bias.add.test {
+    arg0.1 = DTYPE1[32,32,40,30] parameter(0), parameter_replication={false}
+    convert.0 = DTYPE2[32,32,40,30] convert(arg0.1)
+    arg0.2 = DTYPE1[32,32,30,40]parameter(1), parameter_replication={false}
+    convert.1 = DTYPE2[32,32,30,40] convert(arg0.2)
+    dot.7 = DTYPE2[32,32,40,40] dot(convert.0, convert.1), lhs_batch_dims={0,1}, lhs_contracting_dims={3}, rhs_batch_dims={0,1}, rhs_contracting_dims={2}
+    convert.2 = DTYPE1[32,32,40,40] convert(dot.7)
+    const.0 = DTYPE1[40] constant(15)
+    bcast.1 = DTYPE1[32,32,40,40] broadcast(const.0), dimensions={3}
+    add.0 = DTYPE1[32,32,40,40] add(convert.2,bcast.1)
+    const.1 = DTYPE1[32,32,40,40] constant(0.65)
+    add.1 = DTYPE1[32,32,40,40] add(add.0, const.1)
+    convert.3 = DTYPE2[32,32,40,40] convert(add.1)
+    tuple.12 = (DTYPE2[32,32,40,40]) tuple(convert.3)
+    ROOT get-tuple-element.13 = DTYPE2[32,32,40,40] get-tuple-element(tuple.12), index=0
+  })";
+  const std::string module_with_type = absl::StrReplaceAll(
+      matmul_module_str, {{"DTYPE1", dtype1}, {"DTYPE2", dtype2}});
+  return module_with_type;
+}
+
+// Test Matmul + BiasAdd + Add fusion : F32
+TEST_F(MatmulTest, SimpleTestF32WithBiasAndAddFusion) {
+  const std::string matmul_module_str =
+      CreateMatmulBiasAddAndAddModuleText("f32", "f32");
+  EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-4, 1e-4}));
+  MatchOptimizedHlo(matmul_module_str, fused_matmul_bias_add_sum_str_);
+}
+
+// Test Matmul + BiasAdd + Add fusion : BF16
+TEST_F(MatmulTest, SimpleTestBF16WithBiasAndAddFusion) {
+  if (!IsSupportedType(PrimitiveType::BF16)) {
+    GTEST_SKIP() << "CPU does not support BF16.";
+  }
+  const std::string matmul_module_str =
+      CreateMatmulBiasAddAndAddModuleText("f32", "bf16");
+  EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-2, 1e-2}));
+  MatchOptimizedHlo(matmul_module_str, fused_matmul_bias_add_str_);
+}
+
+// Test Matmul + BiasAdd + Add fusion : F16
+TEST_F(MatmulTest, SimpleTestF16WithBiasAndAddFusion) {
+  if (!IsSupportedType(PrimitiveType::F16)) {
+    GTEST_SKIP() << "CPU does not support F16.";
+  }
+  const std::string matmul_module_str =
+      CreateMatmulBiasAddAndAddModuleText("f16", "f16");
+  EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-2, 1e-4}));
+  MatchOptimizedHlo(matmul_module_str, fused_matmul_bias_add_sum_str_);
+}
+
+TEST_F(MatmulTest, SimpleTestF32WithAddFusion_2) {
+  // Only the first Bias should get fused as Bias
+  const char* matmul_module_str = R"(
+  HloModule matmul.add.test.f32
+  ENTRY matmul.add.test.f32 {
+    arg0.1 = f32[32,32,40,30] parameter(0), parameter_replication={false}
+    arg0.2 = f32[32,32,30,40]parameter(1), parameter_replication={false}
+    dot.7 = f32[32,32,40,40] dot(arg0.1, arg0.2), lhs_batch_dims={0,1}, lhs_contracting_dims={3}, rhs_batch_dims={0,1}, rhs_contracting_dims={2}
+    const.0 = f32[40] constant(15)
+    bcast.1 = f32[32,32,40,40] broadcast(const.0), dimensions={3}
+    add.0 = f32[32,32,40,40] add(dot.7,bcast.1)
+    const.1 = f32[40] constant(0.65)
+    bcast.2 = f32[32,32,40,40] broadcast(const.1), dimensions={3}
+    add.1 = f32[32,32,40,40] add(add.0, bcast.2)
+    tuple.12 = (f32[32,32,40,40]) tuple(add.1)
+    ROOT get-tuple-element.13 = f32[32,32,40,40] get-tuple-element(tuple.12), index=0
+  })";
+
+  EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec{1e-4, 1e-4}));
+  MatchOptimizedHlo(matmul_module_str, fused_matmul_bias_);
+}
+
+TEST_F(MatmulTest, MulTanhMul) {
+  const char* matmul_module_str = R"(
+  ENTRY matmul.multanhmul.test.f32 {
+    arg.0 = f32[16,400,500] parameter(0)
+    arg.1 = f32[16,500,3] parameter(1)
+    dot.0 = f32[16,400,3] dot(arg.0, arg.1), lhs_batch_dims={0}, lhs_contracting_dims={2}, rhs_batch_dims={0}, rhs_contracting_dims={1}
+    constant.0 = f32[] constant(0.02)
+    broadcast.0 = f32[16,400,3] broadcast(constant.0), dimensions={}
+    multiply.0 = f32[16,400,3] multiply(dot.0, broadcast.0)
+    tanh.0 = f32[16,400,3] tanh(multiply.0)
+    constant.1 = f32[] constant(50)
+    broadcast.1 = f32[16,400,3] broadcast(constant.1), dimensions={}
+    ROOT multiply.1 = f32[16,400,3] multiply(tanh.0, broadcast.1)
+  })";
+
+  EXPECT_TRUE(RunAndCompare(matmul_module_str, ErrorSpec(1e-4, 1e-4)));
+  MatchOptimizedHlo(matmul_module_str,
+                    R"(
+  ; CHECK:     custom_call_target="__onednn$matmul",
+  ; CHECK:       backend_config={
+  ; CHECK-DAG:     "outer_dimension_partitions":[],
+  ; CHECK-DAG:     "onednn_matmul_config":{
+  ; CHECK-DAG:       "fusions":{
+  ; CHECK-DAG:         "ops":["LINEAR","TANH","LINEAR"]
+  ; CHECK-DAG:     }
+  ; CHECK-DAG:   }
+  ; CHECK:     }
+  )");
+}
+
 }  // namespace cpu
 }  // namespace xla
 
-#endif  // INTEL_MKL && ENABLE_ONEDNN_V3
+#endif  // INTEL_MKL

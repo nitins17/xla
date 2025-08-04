@@ -2,11 +2,11 @@
 # Distributed runtime modules for machine learning, which allows coordination between multiple
 # processes for distributed operations.
 
+load("//xla/tsl:tsl.bzl", "internal_visibility")
 load(
-    "@tsl//tsl/platform:rules_cc.bzl",
+    "//xla/tsl/platform:rules_cc.bzl",
     "cc_library",
 )
-load("//xla/tsl:tsl.bzl", "internal_visibility")
 
 package(
     # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
@@ -21,10 +21,10 @@ cc_library(
     srcs = ["call_options.cc"],
     hdrs = ["call_options.h"],
     deps = [
-        "@tsl//tsl/platform:macros",
-        "@tsl//tsl/platform:mutex",
+        "//xla/tsl/platform:macros",
+        "//xla/tsl/platform:types",
+        "@com_google_absl//absl/synchronization",
         "@tsl//tsl/platform:thread_annotations",
-        "@tsl//tsl/platform:types",
     ],
 )
 

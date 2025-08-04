@@ -71,7 +71,7 @@ absl::Status TransferManager::TransferLiteralFromDevice(
   absl::Cleanup cleanup = [&]() { stream->ReturnSubStream(substream); };
 
   absl::Status ret;
-  tsl::Notification n;
+  absl::Notification n;
   TransferLiteralFromDevice(
       substream, device_buffer, literal,
       [&](absl::Status status) {
@@ -177,12 +177,14 @@ absl::Status TransferManager::ReadDynamicShapes(
             auto metadata,
             TransferArrayFromDevice(
                 stream,
-                ShapeUtil::MakeShape(S32, {buffer_shape.dimensions_size()}),
+                ShapeUtil::MakeShape(
+                    S32,
+                    {static_cast<int64_t>(buffer_shape.dimensions().size())}),
                 metadata_buffer));
 
         // Update shape size from metadata.
         for (int64_t i = 0; i < metadata.element_count(); ++i) {
-          device_sub_shape.mutable_dimensions()[i] = metadata.Get<int32_t>({i});
+          device_sub_shape.set_dimensions(i, metadata.Get<int32_t>({i}));
         }
         return absl::OkStatus();
       }));
@@ -270,6 +272,8 @@ absl::Status TransferManager::WriteRootTupleIndexTable(
                device_memory.size());
 
   std::vector<se::DeviceMemoryBase> elements;
+  elements.reserve(
+      ShapeUtil::TupleElementCount(device_buffer.on_device_shape()));
   for (int64_t i = 0;
        i < ShapeUtil::TupleElementCount(device_buffer.on_device_shape()); ++i) {
     elements.push_back(device_buffer.buffer({i}));
@@ -290,6 +294,7 @@ absl::Status TransferManager::WriteRootTupleIndexTable(
                device_memory.size());
 
   std::vector<se::DeviceMemoryBase> elements;
+  elements.reserve(ShapeUtil::TupleElementCount(buffer_tree.shape()));
   for (int64_t i = 0; i < ShapeUtil::TupleElementCount(buffer_tree.shape());
        ++i) {
     elements.push_back(buffer_tree.element({i}).AsDeviceMemoryBase());

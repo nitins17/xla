@@ -28,6 +28,7 @@ limitations under the License.
 #include "nvtx3/nvToolsExt.h"
 #include "nvtx3/nvToolsExtCuda.h"
 #include "nvtx3/nvToolsExtCudaRt.h"
+#include "nvtx3/nvToolsExtMemCudaRt.h"
 #include "nvtx3/nvToolsExtPayload.h"
 #include "third_party/gpus/cuda/include/cuda.h"
 
@@ -36,7 +37,7 @@ namespace {
 // nvtxNameOsThreadA:
 // https://nvidia.github.io/NVTX/doxygen/group___r_e_s_o_u_r_c_e___n_a_m_i_n_g.html
 // This convention may not match the one in tsl::Env::GetCurrentThreadId().
-std::optional<uint32_t> GetCurrentThreadId() {
+std::optional<uint32_t> MaybeGetCurrentThreadId() {
 #ifdef __linux__
   return syscall(SYS_gettid);
 #else
@@ -57,7 +58,8 @@ ProfilerDomainHandle DefaultProfilerDomain() {
 }
 
 void NameCurrentThread(const std::string& thread_name) {
-  if (std::optional<uint32_t> tid = GetCurrentThreadId(); tid.has_value()) {
+  if (std::optional<uint32_t> tid = MaybeGetCurrentThreadId();
+      tid.has_value()) {
     nvtxNameOsThreadA(*tid, thread_name.c_str());
   }
 }
@@ -91,7 +93,7 @@ void RangePush(ProfilerDomainHandle domain, StringHandle title,
   attrs.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
   attrs.messageType = NVTX_MESSAGE_TYPE_REGISTERED;
   attrs.message.registered = reinterpret_cast<nvtxStringHandle_t>(title);
-  NVTX_PAYLOAD_EVTATTR_SET(attrs, schema_id, payload, payload_size);
+  NVTX_PAYLOAD_EVTATTR_SET(&attrs, schema_id, payload, payload_size);
   nvtxDomainRangePushEx(reinterpret_cast<nvtxDomainHandle_t>(domain), &attrs);
 }
 }  // namespace detail
@@ -118,4 +120,21 @@ StringHandle RegisterString(ProfilerDomainHandle domain,
   buffer.append(suffix);
   return impl(buffer.c_str());
 }
+
+void MarkMemoryInitialized(void const* address, size_t size,
+                           StreamHandle stream) {
+  auto domain = DefaultProfilerDomain();
+  nvtxMemVirtualRangeDesc_t range_desc{size, address};
+  nvtxMemMarkInitializedBatch_t regions_desc{
+      NVTX_EXT_COMPATID_MEM,
+      sizeof(nvtxMemMarkInitializedBatch_t),
+      NVTX_MEM_TYPE_VIRTUAL_ADDRESS,
+      /*regionDescCount=*/1,
+      sizeof(nvtxMemVirtualRangeDesc_t),
+      &range_desc};
+  nvtxMemCudaMarkInitialized(reinterpret_cast<nvtxDomainHandle_t>(domain),
+                             reinterpret_cast<cudaStream_t>(stream),
+                             /*isPerThreadStream=*/false, &regions_desc);
+}
+
 }  // namespace tsl::profiler

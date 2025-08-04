@@ -21,30 +21,34 @@ limitations under the License.
 #include <cstdlib>
 #include <optional>
 #include <stack>
+#include <utility>
 #include <vector>
 
 #include "absl/container/flat_hash_map.h"
-#include "absl/container/inlined_vector.h"
-#include "absl/log/check.h"
-#include "absl/log/log.h"
 #include "absl/types/span.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/Support/MathExtras.h"
 #include "mlir/IR/AffineExpr.h"
 #include "mlir/IR/AffineMap.h"
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/Support/LLVM.h"
+#include "xla/backends/gpu/codegen/fusion_emitter.h"
+#include "xla/backends/gpu/codegen/fusions.h"
+#include "xla/hlo/analysis/indexing_analysis.h"
+#include "xla/hlo/analysis/indexing_map.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/hlo/utils/hlo_traversal.h"
 #include "xla/layout.h"
-#include "xla/service/gpu/fusions/fusion_emitter.h"
 #include "xla/service/gpu/gpu_fusible.h"
 #include "xla/service/gpu/hlo_fusion_analysis.h"
-#include "xla/service/gpu/hlo_traversal.h"
 #include "xla/service/gpu/model/affine_map_evaluator.h"
-#include "xla/service/gpu/model/indexing_analysis.h"
-#include "xla/service/gpu/model/indexing_map.h"
+#include "xla/service/gpu/model/tiled_hlo_instruction.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
+#include "xla/stream_executor/device_description.h"
+#include "xla/util.h"
+#include "xla/xla_data.pb.h"
 
 namespace xla {
 namespace gpu {
@@ -53,6 +57,7 @@ namespace gpu {
 // producer and consumer are considered as one fusion, otherwise it's only the
 // producer.
 bool IsReadCoalescedHeuristic(HloFusionAnalysis::EmitterFusionKind fusion_kind,
+                              const se::DeviceDescription& device_info,
                               const HloInstruction* producer,
                               const HloInstruction* consumer) {
   // Transposing minor dimension breaks coalescing.
@@ -90,22 +95,101 @@ bool IsReadCoalescedHeuristic(HloFusionAnalysis::EmitterFusionKind fusion_kind,
   }
   // Fusing two row reductions breaks coalescing.
   if (fusion_kind == HloFusionAnalysis::EmitterFusionKind::kReduction &&
-      IsInputFusibleReduction(*producer) && consumer &&
-      IsInputFusibleReduction(*consumer)) {
+      IsInputFusibleReduction(*producer, device_info) && consumer &&
+      IsInputFusibleReduction(*consumer, device_info)) {
     return false;
   }
   return true;
+}
+
+double BandwidthUtilizationRateHeuristicForTiledMemoryAccess(
+    const TiledHloInstruction& hbm_access_instr,
+    const se::DeviceDescription& device_info) {
+  const HloInstruction* hlo = hbm_access_instr.hlo();
+  const Shape& shape = hlo->shape();
+
+  // Compute the number of elements in the contiguous part of the tile.
+  int64_t contiguous_elements = 1;
+  for (const auto dim_idx : shape.layout().minor_to_major()) {
+    // This dimension is strided, so it's not contiguous.
+    if (hbm_access_instr.tile_stride(dim_idx) != 1) {
+      break;
+    }
+
+    int64_t tile_size = hbm_access_instr.tile_size(dim_idx);
+    int64_t dim_size = shape.dimensions(dim_idx);
+
+    // Make sure to ignore the mask if there is one.
+    contiguous_elements *= std::min(tile_size, dim_size);
+
+    // This dimension is only partially captured, so more major dimensions are
+    // necessarily not captured contiguously.
+    if (tile_size < dim_size) {
+      break;
+    }
+  }
+
+  // Compute the size of the contiguous part of the tile in bytes.
+  int64_t contiguous_bytes_accessed =
+      contiguous_elements *
+      ShapeUtil::ByteSizeOfPrimitiveType(hlo->shape().element_type());
+
+  // Memory accesses are fully coalesced if the memory access uses exactly a
+  // multiple of the DRAM->L2 cache line size contiguously.
+  int64_t transaction_size_bytes =
+      device_info.dram_to_l2_transaction_size_bytes();
+  int64_t effective_bytes_accessed =
+      transaction_size_bytes *
+      CeilOfRatio(contiguous_bytes_accessed, transaction_size_bytes);
+  return 1.0 * contiguous_bytes_accessed / effective_bytes_accessed;
+}
+
+bool IsTiledReadCoalescedHeuristic(const TiledHloInstruction& operand,
+                                   const se::DeviceDescription& device_info) {
+  const Shape& shape = operand.hlo()->shape();
+
+  // Compute the number of elements in the contiguous part of the tile.
+  int64_t contiguous_read_elements = 1;
+  for (const auto dim_idx : shape.layout().minor_to_major()) {
+    // This dimension is strided, so it's not contiguous.
+    if (operand.tile_stride(dim_idx) != 1) {
+      break;
+    }
+
+    int64_t tile_size = operand.tile_size(dim_idx);
+    int64_t dim_size = shape.dimensions(dim_idx);
+
+    // Make sure to ignore the mask if there is one.
+    contiguous_read_elements *= std::min(tile_size, dim_size);
+
+    // This dimension is only partially captured, so more major dimensions are
+    // necessarily not captured contiguously.
+    if (tile_size < dim_size) {
+      break;
+    }
+  }
+
+  // Compute the size of the contiguous part of the tile in bytes.
+  int64_t contiguous_bytes_accessed =
+      contiguous_read_elements *
+      ShapeUtil::ByteSizeOfPrimitiveType(operand.hlo()->shape().element_type());
+
+  // We consider a read coalesced if the contiguous part of the read covers the
+  // whole DRAM->L2 cache line.
+  //
+  // TODO(b/332714755): note that we don't check that we fully exploit all the
+  // cache lines we read from if we happen to read through several of them.
+  return contiguous_bytes_accessed >=
+         device_info.dram_to_l2_transaction_size_bytes();
 }
 
 namespace {
 
 using ::mlir::AffineBinaryOpExpr;
 using ::mlir::AffineConstantExpr;
-using ::mlir::AffineDimExpr;
 using ::mlir::AffineExpr;
 using ::mlir::AffineExprKind;
 using ::mlir::AffineMap;
-using ::mlir::AffineSymbolExpr;
 using ::mlir::getAffineConstantExpr;
 using ::mlir::MLIRContext;
 
@@ -138,12 +222,11 @@ bool EstimateCoalescingViaMemoryTransactionsCount(
 
 // Returns a linearized shape, i.e. tensor<num_elements(input) x element_type>.
 Shape GetLinearizedShape(const Shape& shape) {
-  if (shape.rank() == 0) {
+  if (shape.dimensions().empty()) {
     return shape;
   }
   std::vector<int64_t> dims{ShapeUtil::ElementsIn(shape)};
-  auto result = Shape(shape.element_type(), dims,
-                      absl::InlinedVector<bool, 4>(dims.size(), false), {});
+  auto result = Shape(shape.element_type(), dims);
   *result.mutable_layout() = xla::Layout({0});
   return result;
 }
@@ -151,16 +234,24 @@ Shape GetLinearizedShape(const Shape& shape) {
 // Returns thread ID to linearized physical layout indexing map for each operand
 // of the fusion.
 std::optional<GroupedByOpIndexingMap> GetThreadIdToInputMemoryLayoutsMaps(
-    const HloFusionAdaptor& fusion_adaptor,
-    absl::Span<const HloInstruction* const> operands,
     const HloFusionAnalysis& fusion_analysis,
-    KernelFusionInterface* fusion_interface, MLIRContext* mlir_context) {
+    absl::Span<const HloInstruction* const> operands,
+    MLIRContext* mlir_context) {
+  auto emitter =
+      GetFusionEmitter(PreBufferAssignmentFusionInfo{fusion_analysis});
+  const auto* fusion_interface =
+      dynamic_cast<const KernelFusionInterface*>(emitter.get());
+
+  if (fusion_interface == nullptr) {
+    return std::nullopt;
+  }
+
   GroupedByOpIndexingMap result;
   for (const auto& [root_index, hero] :
        llvm::enumerate(fusion_analysis.fusion_heroes())) {
     for (const auto& [hero_operand_index, hero_operand] :
          llvm::enumerate(hero.GetOperands())) {
-      if (hero_operand.shape().rank() == 0) {
+      if (hero_operand.shape().dimensions().empty()) {
         continue;
       }
       // Compute thread ID -> hero operand indexing map.
@@ -171,9 +262,9 @@ std::optional<GroupedByOpIndexingMap> GetThreadIdToInputMemoryLayoutsMaps(
         return std::nullopt;
       }
       // Compute indexing from output to inputs for logical layout.
-      GroupedByOpIndexingMap instr_indexing_keyed_by_operands =
-          ComputeGroupedOutputToInputIndexing(fusion_adaptor, hero_operand,
-                                              mlir_context);
+      GroupedByOpIndexing instr_indexing_keyed_by_operands =
+          ComputeGroupedOutputToInputIndexing(fusion_analysis.fusion(),
+                                              hero_operand, mlir_context);
       // For every operand compute thread ID -> physical layout of operand
       // indexing map.
       for (const HloInstruction* operand : operands) {
@@ -197,8 +288,9 @@ std::optional<GroupedByOpIndexingMap> GetThreadIdToInputMemoryLayoutsMaps(
             operand_physical_to_linearized_shape;
         operand_logical_to_linearized_physical_shape.Simplify();
 
-        for (const IndexingMap& operand_indexing_map :
+        for (const OperandIndexing& operand_indexing :
              operand_indexing_maps_it->second) {
+          const IndexingMap& operand_indexing_map = operand_indexing.map();
           // If one of the indexing maps for the operand is undefined, we remove
           // all indexing maps for it and store only the undefined one.
           if (operand_indexing_map.IsUndefined()) {
@@ -233,11 +325,10 @@ void AssignValuesToRTVars(IndexingMap* indexing_map) {
     symbol_replacements.push_back(
         mlir::getAffineSymbolExpr(symbol_id, mlir_context));
   }
-  for (const RTVar& rt_var : indexing_map->GetRTVars()) {
+  for (const IndexingMap::Variable& rt_var : indexing_map->GetRTVars()) {
     // Take midpoint of the feasible interval for the RT variable.
     symbol_replacements.push_back(getAffineConstantExpr(
-        (rt_var.feasible_values.lower + rt_var.feasible_values.upper) / 2,
-        mlir_context));
+        (rt_var.bounds.lower + rt_var.bounds.upper) / 2, mlir_context));
   }
   AffineMap thread_x_to_input_no_dim_symbols =
       indexing_map->GetAffineMap().replaceDimsAndSymbols(
@@ -263,7 +354,7 @@ void AssignValuesToOuterLoopIVs(IndexingMap* indexing_map) {
   for (int64_t symbol_id = 0; symbol_id < indexing_map->GetRangeVarsCount() - 1;
        ++symbol_id) {
     symbol_replacements.push_back(getAffineConstantExpr(
-        indexing_map->GetRangeVar(symbol_id).range.lower, mlir_context));
+        indexing_map->GetRangeVar(symbol_id).bounds.lower, mlir_context));
   }
   symbol_replacements.push_back(mlir::getAffineSymbolExpr(0, mlir_context));
 
@@ -466,7 +557,7 @@ std::vector<Interval> FindContiguousIntervals(
   }
   // Case 2: f(thread_x) != thread_x * multiplier.
   auto intervals = FindIntervals(partitioned_expr.func_of_d0,
-                                 {indexing_map.GetDimVars(0).bounds});
+                                 {indexing_map.GetDimVar(0).bounds});
   // Case 2.1: g(s) != s.
   if (partitioned_expr.func_of_s0 != range) {
     return intervals;
@@ -498,7 +589,7 @@ bool IsIndexingCoalesced(IndexingMap& thread_x_to_linearized_input,
   AffineExpr c0 = getAffineConstantExpr(0, mlir_context);
   IndexingMap thread_x_first_32_elements{
       AffineMap::get(1, 0, {thread_x_dim, c0, c0, c0, c0, c0}, mlir_context),
-      {DimVar{{0, 31}}},
+      {IndexingMap::Variable{{0, 31}}},
       /*range_vars=*/{},
       /*rt_vars=*/{}};
   IndexingMap thread_x_to_input_sample =
@@ -532,58 +623,21 @@ bool IsIndexingCoalesced(IndexingMap& thread_x_to_linearized_input,
       element_type);
 }
 
-}  // namespace
-
-CoalescingAnalysis::CoalescingAnalysis(
-    const HloInstruction* instr,
-    absl::Span<const HloInstruction* const> operands,
+std::optional<CoalescingMap> ComputeCoalescingForAllOperands(
     const HloFusionAnalysis& fusion_analysis,
-    KernelFusionInterface* fusion_interface, MLIRContext* mlir_context,
-    bool use_heuristic) {
-  auto fusion_adaptor = HloFusionAdaptor::ForInstruction(instr);
-  if (!use_heuristic && ComputeCoalescingForAllOperands(
-                            *fusion_adaptor, operands, fusion_analysis,
-                            fusion_interface, mlir_context)) {
-    return;
-  }
-  // If ComputeCoalescingForAllOperands fails, fallback to using the heuristic.
-  is_coalesced_computed_by_heuristic_ =
-      IsReadCoalescedHeuristic(fusion_analysis.GetEmitterFusionKind(), instr);
-}
-
-CoalescingAnalysis::CoalescingAnalysis(
-    const HloInstruction* producer, const HloInstruction* consumer,
     absl::Span<const HloInstruction* const> operands,
-    const HloFusionAnalysis& fusion_analysis,
-    KernelFusionInterface* fusion_interface, MLIRContext* mlir_context,
-    bool use_heuristic) {
-  auto fusion_adaptor =
-      HloFusionAdaptor::ForProducerConsumer(producer, consumer);
-  if (!use_heuristic && ComputeCoalescingForAllOperands(
-                            *fusion_adaptor, operands, fusion_analysis,
-                            fusion_interface, mlir_context)) {
-    return;
-  }
-  // If ComputeCoalescingForAllOperands fails, fallback to using the heuristic.
-  is_coalesced_computed_by_heuristic_ = IsReadCoalescedHeuristic(
-      fusion_analysis.GetEmitterFusionKind(), producer, consumer);
-}
-
-bool CoalescingAnalysis::ComputeCoalescingForAllOperands(
-    const HloFusionAdaptor& fusion_adaptor,
-    absl::Span<const HloInstruction* const> operands,
-    const HloFusionAnalysis& fusion_analysis,
-    KernelFusionInterface* fusion_interface, MLIRContext* mlir_context) {
+    MLIRContext* mlir_context) {
   std::optional<GroupedByOpIndexingMap> thread_id_to_input_memory_layouts =
-      GetThreadIdToInputMemoryLayoutsMaps(fusion_adaptor, operands,
-                                          fusion_analysis, fusion_interface,
+      GetThreadIdToInputMemoryLayoutsMaps(fusion_analysis, operands,
                                           mlir_context);
   if (!thread_id_to_input_memory_layouts.has_value()) {
-    return false;
+    return std::nullopt;
   }
+
+  CoalescingMap coalescing_per_operand;
   for (const HloInstruction* operand : operands) {
-    if (operand->shape().rank() == 0) {
-      coalescing_per_operand_.insert({operand, true});
+    if (operand->shape().dimensions().empty()) {
+      coalescing_per_operand.insert({operand, true});
       continue;
     }
     auto operand_indexing_maps =
@@ -591,21 +645,59 @@ bool CoalescingAnalysis::ComputeCoalescingForAllOperands(
     // If there is no indexing map for the operand, it means that it is not used
     // in the fusion cluster.
     if (operand_indexing_maps == thread_id_to_input_memory_layouts->end()) {
-      coalescing_per_operand_.insert({operand, true});
+      coalescing_per_operand.insert({operand, true});
       continue;
     }
     for (IndexingMap operand_indexing_map : operand_indexing_maps->second) {
       bool is_coalesced = IsIndexingCoalesced(operand_indexing_map,
                                               operand->shape().element_type());
       auto [it, inserted] =
-          coalescing_per_operand_.insert({operand, is_coalesced});
+          coalescing_per_operand.insert({operand, is_coalesced});
       if (!inserted) {
         it->second &= is_coalesced;
       }
-      if (!is_coalesced) break;
+      if (!is_coalesced) {
+        break;
+      }
     }
   }
-  return true;
+  return coalescing_per_operand;
+}
+
+}  // namespace
+
+/*static*/
+CoalescingAnalysis CoalescingAnalysis::Create(
+    const HloInstruction* instr,
+    absl::Span<const HloInstruction* const> operands,
+    const HloFusionAnalysis& fusion_analysis, MLIRContext* mlir_context,
+    bool use_heuristic) {
+  return Create(/*producer=*/instr, /*consumer=*/nullptr, operands,
+                fusion_analysis, mlir_context, use_heuristic);
+}
+
+/*static*/
+CoalescingAnalysis CoalescingAnalysis::Create(
+    const HloInstruction* producer, const HloInstruction* consumer,
+    absl::Span<const HloInstruction* const> operands,
+    const HloFusionAnalysis& fusion_analysis, MLIRContext* mlir_context,
+    bool use_heuristic) {
+  std::optional<CoalescingMap> coalescing_per_operand;
+
+  if (!use_heuristic) {
+    coalescing_per_operand = ComputeCoalescingForAllOperands(
+        fusion_analysis, operands, mlir_context);
+  }
+
+  if (coalescing_per_operand.has_value()) {
+    return CoalescingAnalysis(std::move(*coalescing_per_operand));
+  }
+
+  bool is_coalesced_computed_by_heuristic = IsReadCoalescedHeuristic(
+      fusion_analysis.emitter_fusion_kind(), fusion_analysis.device_info(),
+      producer, consumer);
+
+  return CoalescingAnalysis(is_coalesced_computed_by_heuristic);
 }
 
 bool CoalescingAnalysis::IsReadCoalesced(const HloInstruction* operand) const {

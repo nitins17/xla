@@ -20,11 +20,12 @@ limitations under the License.
 #include <utility>
 #include <vector>
 
+#include <gtest/gtest.h>
+#include "xla/hlo/testlib/test.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
-#include "xla/test.h"
+#include "xla/tsl/platform/test_benchmark.h"
 #include "xla/xla_data.pb.h"
-#include "tsl/platform/test_benchmark.h"
 
 namespace xla {
 namespace {
@@ -653,7 +654,7 @@ void BM_Iterate(::testing::benchmark::State& state) {
 }
 
 #define BENCHMARK_WITH_ARGS(name) \
-  BENCHMARK(name)->ArgPair(2, 8)->ArgPair(1, 1000)
+  BENCHMARK(name)->ArgPair(0, 0)->ArgPair(2, 8)->ArgPair(1, 1000)
 
 BENCHMARK_WITH_ARGS(BM_Construct);
 BENCHMARK_WITH_ARGS(BM_ConstructUnowned);

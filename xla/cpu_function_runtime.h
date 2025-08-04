@@ -21,6 +21,9 @@ limitations under the License.
 #include <cassert>
 #include <cstdlib>
 
+#include "absl/base/macros.h"
+#include "xla/backends/cpu/alignment.h"
+
 namespace xla {
 namespace cpu_function_runtime {
 
@@ -42,8 +45,7 @@ class BufferInfo {
         entry_param_number_(encoded.entry_param_number),
         result_param_number_(encoded.result_param_number) {}
 
-  // Returns true if this buffer stores a constant.  These never need to be
-  // allocated by the runtime.
+  // Returns true if this buffer stores a constant.
   bool is_constant() const { return kind() == Kind::kConstant; }
 
   // Returns true if this buffer stores an entry parameter.  These may or may
@@ -176,10 +178,12 @@ class BufferInfo {
 };
 
 // Align to 64-bytes, to mimic tsl::Allocator::kAllocatorAlignment.
-inline constexpr size_t Align() { return 64; }
+ABSL_DEPRECATE_AND_INLINE()
+inline constexpr size_t Align() { return xla::cpu::Align(); }
 
 // The minimum alignment of buffers passed to XLA:CPU.
-inline constexpr size_t MinAlign() { return 16; }
+ABSL_DEPRECATE_AND_INLINE()
+inline constexpr size_t MinAlign() { return xla::cpu::MinAlign(); }
 
 // When declaring variables that will be passed to an XLA instance as input via
 // set_arg_data(), be it a regular input or a resource variable in the graph,

@@ -23,6 +23,7 @@ limitations under the License.
 
 #include "absl/container/flat_hash_map.h"
 #include "absl/types/span.h"
+#include "xla/hlo/analysis/hlo_alias_analysis.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/utils/hlo_live_range.h"
 #include "xla/service/memory_space_assignment/allocation.h"
@@ -39,17 +40,19 @@ enum class MemoryTransferDirection {
 };
 
 // REQUIRES:
-// * async_copy must be an async copy-start instruction.
-MemoryTransferDirection GetAsyncCopyDirection(const HloInstruction* async_copy,
-                                              int64_t alternate_memory_space);
+// * async_copy_like_start must be an async copy-start or slice-start
+// instruction.
+MemoryTransferDirection GetAsyncCopyLikeDirection(
+    const HloInstruction* async_copy_like_start,
+    int64_t alternate_memory_space);
 
-// This struct is used to track the outstanding async copy instructions and
+// This struct is used to track the outstanding async copy like instructions and
 // the remaining bytes required to be accessed.
-struct OutstandingAsyncCopy {
-  const HloInstruction* copy_start_inst;
+struct OutstandingAsyncCopyLike {
+  const HloInstruction* copy_like_start_inst;
   float remaining_bytes_to_transfer;
-  bool operator==(const OutstandingAsyncCopy& other) const {
-    return copy_start_inst == other.copy_start_inst &&
+  bool operator==(const OutstandingAsyncCopyLike& other) const {
+    return copy_like_start_inst == other.copy_like_start_inst &&
            remaining_bytes_to_transfer == other.remaining_bytes_to_transfer;
   }
 };
@@ -57,6 +60,13 @@ struct OutstandingAsyncCopy {
 // A wrapper class around runtime simulator.
 class RuntimeSimulator {
  public:
+  // A struct that captures an instructions elapsed time and the amount of time
+  // we estimate default memory bandwidth to be idle, during that instruction.
+  struct ElapsedAndIdleTimes {
+    float elapsed_time;
+    float idle_default_memory_bandwidth_time;
+  };
+
   explicit RuntimeSimulator(CostAnalysis* cost_analysis,
                             int64_t alternate_memory_space)
       : cost_analysis_(cost_analysis),
@@ -66,8 +76,9 @@ class RuntimeSimulator {
   // testing purpose.
   explicit RuntimeSimulator(
       CostAnalysis* cost_analysis, int64_t alternate_memory_space,
-      const std::list<OutstandingAsyncCopy>& outstanding_read_default_queue,
-      const std::list<OutstandingAsyncCopy>& outstanding_write_default_queue)
+      const std::list<OutstandingAsyncCopyLike>& outstanding_read_default_queue,
+      const std::list<OutstandingAsyncCopyLike>&
+          outstanding_write_default_queue)
       : cost_analysis_(cost_analysis),
         alternate_memory_space_(alternate_memory_space),
         outstanding_read_default_queue_(outstanding_read_default_queue),
@@ -77,28 +88,33 @@ class RuntimeSimulator {
 
   // This function provides a basic estimate without considering the overhead of
   // async copies.
-  float SimulateElapsedTimeWithoutAsyncCopies(
+  float SimulateElapsedTimeWithoutAsyncCopyLikes(
       const HloLiveRange& hlo_live_range,
       const AllocationSequence& allocations);
 
   // Returns the time to simulate the hlo_live_range, when we account for the
-  // waiting time for async copies to finish.
+  // waiting time for async copy like instructions to finish.
   //
-  // To simulate the overhead of async copies, we need to maintain two queues to
-  // track the outstanding memory access requests that read/write the default
-  // memory. When we simulate compute, we use any time there is spare bandwidth
-  // to simulate async memory accesses to default memory. If we get to an async
-  // copy done, we must wait until it finishes (potentially waiting for copies
-  // issued before it to finish.
-  float SimulateElapsedTime(const HloModule* hlo_module,
-                            const AllocationSequence& allocations);
+  // To simulate the overhead of async copy like instructions, we need to
+  // maintain two queues to track the outstanding memory access requests that
+  // read/write the default memory. When we simulate compute, we use any time
+  // there is spare bandwidth to simulate async memory accesses to default
+  // memory. If we get to an async copy like done, we must wait until it
+  // finishes (potentially waiting for copies issued before it to finish.
+  //
+  // alt_mem_bytes_occupied is a vector of the amount of alt mem bytes allocated
+  // at any given instruction. It may be null.
+  float SimulateElapsedTime(
+      const HloModule* hlo_module, const HloAliasAnalysis& alias_analysis,
+      const AllocationSequence& allocations,
+      const std::vector<int64_t>* alt_mem_bytes_occupied = nullptr);
 
   // This is an auxiliary function for simulating the execution
   // time for executing a copy-done instruction. It returns the
   // elapsed time (in seconds) for executing the copy-done instruction.
   //
-  // This function also updates the passed in queues as we complete async copies
-  // during the simulation.
+  // This function also updates the passed in queues as we complete async copy
+  // like instructions during the simulation.
   //
   // We simulate the shared bandwidth for default-alternate memory access.
   // For example, if the copy-done instruction is a default-write memory
@@ -106,11 +122,13 @@ class RuntimeSimulator {
   // outstanding_read_default_queue, then we use half of the bandwidth to
   // process both requests in parallel. Otherwise, we use the full bandwidth to
   // process the default-write request.
-  float SimulateAsyncCopyDone(const HloInstruction* copy_done_instruction);
+  float SimulateAsyncCopyLikeDone(
+      const HloInstruction* copy_like_done_instruction);
 
-  const std::list<OutstandingAsyncCopy>& GetOutstandingReadDefaultQueue() const;
+  const std::list<OutstandingAsyncCopyLike>& GetOutstandingReadDefaultQueue()
+      const;
 
-  const std::list<OutstandingAsyncCopy>& GetOutstandingWriteDefaultQueue()
+  const std::list<OutstandingAsyncCopyLike>& GetOutstandingWriteDefaultQueue()
       const;
 
   // This is an auxiliary function for simulating the execution
@@ -120,7 +138,7 @@ class RuntimeSimulator {
   // Aside from returning the elapsed time, this function also updates the
   // outstanding memory request queues, by draining them when the compute
   // instruction is not occupying bandwidth.
-  float SimulateComputeInstruction(
+  ElapsedAndIdleTimes SimulateComputeInstruction(
       const HloInstruction* compute_instruction,
       absl::Span<const std::pair<int64_t, ShapeIndex>>
           operands_in_alternate_memory,
@@ -140,17 +158,20 @@ class RuntimeSimulator {
   // process), the function returns the instruction and pop it from the queue.
   // Otherwise, it returns nullptr.
   const HloInstruction* RemoveBytesFromQueueIfNotEmpty(
-      std::list<OutstandingAsyncCopy>& async_copy_queue, float processed_bytes);
+      std::list<OutstandingAsyncCopyLike>& async_copy_like_queue,
+      float processed_bytes);
 
   // This is an auxiliary function which simulates the process of draining
   // the memory access queues in a given amount of time (seconds). If both
   // outstanding_*_default_queues are non-empty, they share bandwidth. If one of
   // the queues is empty and the other is not, it gets the full bandwdith.
-  void ProcessAsyncCopiesInIdleTime(float time);
+  //
+  // Returns the remaining idle time after processing async-copy-likes.
+  float ProcessAsyncCopyLikesInIdleTime(float time);
 
   int64_t alternate_memory_space_;
-  std::list<OutstandingAsyncCopy> outstanding_read_default_queue_;
-  std::list<OutstandingAsyncCopy> outstanding_write_default_queue_;
+  std::list<OutstandingAsyncCopyLike> outstanding_read_default_queue_;
+  std::list<OutstandingAsyncCopyLike> outstanding_write_default_queue_;
   absl::flat_hash_map<const HloInstruction*, std::vector<ShapeIndex>>
       outputs_in_alternate_memory_map_;
   absl::flat_hash_map<const HloInstruction*,

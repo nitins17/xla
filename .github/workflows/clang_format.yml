@@ -14,9 +14,13 @@
 # ============================================================================
 
 name: Clang Format
-permissions: read-all
+permissions:
+  contents: read
 on:
   pull_request:
+  push:
+    branches:
+      - main
 
 jobs:
   clang-format:
@@ -24,13 +28,13 @@ jobs:
     defaults:
       run:
         shell: bash
-    timeout-minutes: 1
+    timeout-minutes: 6
     if: |
       github.event.sender.type == 'User' ||
       contains(github.event.pull_request.body, 'FORCE_TEST_ACTIONS')
     steps:
       - name: "Checking out repository"
-        uses: actions/checkout@e2f20e631ae6d7dd3b768f56a5d2af784dd54791 # v2.5.0
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: "Fetch HEAD of main branch"
         run: git fetch origin main --depth=1
       - name: "Run clang-format" # Use pipx to get version that apt doesn't have by default

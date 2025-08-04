@@ -1,6 +1,7 @@
 load("@bazel_skylib//rules:build_test.bzl", "build_test")
 load("@bazel_skylib//rules:expand_template.bzl", "expand_template")
 load("@llvm-project//llvm:lit_test.bzl", "lit_test", "package_path")
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
 
 package(
     # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
@@ -20,7 +21,7 @@ package(
             "@llvm-project//llvm:not",
             "@llvm-project//mlir:libmlir_c_runner_utils.so",
             "@llvm-project//mlir:libmlir_runner_utils.so",
-            "@llvm-project//mlir:mlir-cpu-runner",
+            "@llvm-project//mlir:mlir-runner",
         ],
         # copybara:uncomment driver = "@llvm-project//mlir:run_lit",
         tags = [

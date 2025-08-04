@@ -15,19 +15,20 @@ limitations under the License.
 #include "xla/python/profiler/internal/python_hooks.h"
 
 #include <atomic>
+#include <cstdint>
 #include <string>
 
 #include "absl/log/log.h"
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/strings/strip.h"
-#include "tsl/platform/env.h"
+#include "xla/tsl/platform/env.h"
+#include "xla/tsl/profiler/utils/time_utils.h"
+#include "xla/tsl/profiler/utils/xplane_builder.h"
+#include "xla/tsl/profiler/utils/xplane_schema.h"
+#include "xla/tsl/profiler/utils/xplane_utils.h"
 #include "tsl/platform/path.h"
 #include "tsl/profiler/protobuf/xplane.pb.h"
-#include "tsl/profiler/utils/time_utils.h"
-#include "tsl/profiler/utils/xplane_builder.h"
-#include "tsl/profiler/utils/xplane_schema.h"
-#include "tsl/profiler/utils/xplane_utils.h"
 
 namespace xla {
 namespace profiler {
@@ -60,7 +61,7 @@ std::string GetEventName(PyObject* co_filename, PyObject* co_name,
                       " ", function);
 }
 
-std::string GetEventName(PyMethodDef* method, PyObject* module) {
+std::string GetEventName(absl::string_view method_name, PyObject* module) {
   // Python stack does not have a filename/line_no for native calls.
   // Use module name and function/method name instead.
   std::string filename;
@@ -75,8 +76,10 @@ std::string GetEventName(PyMethodDef* method, PyObject* module) {
   } else {
     filename = "<unknown>";
   }
-
-  return absl::StrCat("$", filename, " ", method->ml_name);
+  if (!method_name.empty()) {
+    return absl::StrCat("$", filename, " ", method_name);
+  }
+  return "$<unknown>";
 }
 
 void AddEventToXLine(const PythonTraceEntry& event,
@@ -88,6 +91,7 @@ void AddEventToXLine(const PythonTraceEntry& event,
   xevent.SetEndTimestampNs(event.end_time_ns);
 }
 
+#if PY_VERSION_HEX < 0x030C0000
 template <typename ForEachThreadFunc>
 void ForEachThread(PyThreadState* curr_thread, ForEachThreadFunc&& callback) {
   // Note: PyThreadState's interp is not accessible in open source due to
@@ -115,27 +119,28 @@ void ForEachThread(PyThreadState* curr_thread, ForEachThreadFunc&& callback) {
 #endif
 }
 
+#endif  // PY_VERSION_HEX
+
 }  // namespace
 
 /*static*/ PythonHookContext* PythonHooks::e2e_context_ = nullptr;
 
 std::string PythonTraceEntry::Name() const {
-  std::string event_name;
   if (co_filename) {
     return GetEventName(co_filename, co_name, co_firstlineno);
-  } else {
-    return GetEventName(method_def, m_module);
   }
-  return "<unknown>";
+  return GetEventName(method_name, m_module);
 }
 
 PythonHooks* PythonHooks::GetSingleton() {
-  static PythonHooks* singleton = new PythonHooks;
+  static PythonHooks* const singleton = new PythonHooks;
   return singleton;
 }
 
 void PythonHookContext::Start(const PythonHooksOptions& options) {
-  if (!Py_IsInitialized()) return;
+  if (!Py_IsInitialized()) {
+    return;
+  }
 
 #if PY_MAJOR_VERSION < 3 || (PY_MAJOR_VERSION == 3 && PY_MINOR_VERSION < 7)
   // Before Python 3.7, the GIL is created on demand by PyEval_InitThreads().
@@ -183,7 +188,9 @@ void PythonHookContext::Start(const PythonHooksOptions& options) {
 }
 
 void PythonHookContext::Stop() {
-  if (!Py_IsInitialized()) return;
+  if (!Py_IsInitialized()) {
+    return;
+  }
   if (options_.enable_python_traceme || options_.enable_trace_python_function) {
     PyGILState_STATE gil_state = PyGILState_Ensure();
     if (options_.enable_trace_python_function) {
@@ -203,7 +210,7 @@ void PythonHookContext::CollectData(tensorflow::profiler::XPlane* raw_plane) {
   }
   tsl::profiler::XPlaneBuilder plane(raw_plane);
   for (auto& it : entries_) {
-    uint32_t thread_id = it.first;
+    int64_t thread_id = it.first;
     auto& thread_events = it.second;
     VLOG(1) << "Collecting " << thread_events.completed.size() << ":"
             << thread_events.active.size() << " events on thread " << thread_id;
@@ -284,7 +291,7 @@ void PythonHooks::ProfileSlow(const py::object& frame, const std::string& event,
 
 void PythonHookContext::ProfileFast(PyFrameObject* frame, int what,
                                     PyObject* arg) {
-  const uint32_t thread_id = tsl::Env::Default()->GetCurrentThreadId();
+  const int64_t thread_id = tsl::Env::Default()->GetCurrentThreadId();
   uint64_t now = tsl::profiler::GetCurrentTimeNanos();
   auto& thread_traces = entries_[thread_id];
 
@@ -323,18 +330,18 @@ void PythonHookContext::ProfileFast(PyFrameObject* frame, int what,
       if (PyCFunction_Check(arg)) {
         // Python stack does not have a filename/line_no for native calls.
         auto* func = reinterpret_cast<PyCFunctionObject*>(arg);
-        entries_[thread_id].active.emplace(now, 0, func);
+        entries_[thread_id].active_c.emplace(now, 0, func);
       }
       break;
     }
     case PyTrace_C_RETURN:
     case PyTrace_C_EXCEPTION: {
       if (PyCFunction_Check(arg)) {
-        if (!thread_traces.active.empty()) {
-          auto& entry = thread_traces.active.top();
+        if (!thread_traces.active_c.empty()) {
+          auto& entry = thread_traces.active_c.top();
           entry.end_time_ns = now;
           thread_traces.completed.emplace_back(std::move(entry));
-          thread_traces.active.pop();
+          thread_traces.active_c.pop();
         } else if (options_.include_incomplete_events) {
           // Only the end of the events is recorded, use profiler start as
           // start timestamp of the new event.
@@ -371,21 +378,29 @@ void PythonHookContext::ProfileFast(PyFrameObject* frame, int what,
 
   // NOTE: This must be after `threading.setprofile` otherwise we
   // end up recording that in our trace.
+#if PY_VERSION_HEX < 0x030C0000
   PyThreadState* curr_thread = PyThreadState_Get();
   ForEachThread(curr_thread, [](PyThreadState* thread) {
     VLOG(1) << "Setting profiler in " << thread->thread_id;
     PyEval_SetProfile(&PythonHooks::ProfileFunction, nullptr);
   });
   PyThreadState_Swap(curr_thread);
+#else   // PY_VERSION_HEX >= 0x030C0000
+  PyEval_SetProfileAllThreads(&PythonHooks::ProfileFunction, nullptr);
+#endif  // PY_VERSION_HEX >= 0x030C0000
 }
 
 /*static*/ void PythonHookContext::ClearProfilerInAllThreads() {
+#if PY_VERSION_HEX < 0x030C0000
   PyThreadState* curr_thread = PyThreadState_Get();
   ForEachThread(curr_thread, [](PyThreadState* thread) {
     VLOG(1) << "Clearing profiler in " << thread->thread_id;
     PyEval_SetProfile(nullptr, nullptr);
   });
   PyThreadState_Swap(curr_thread);
+#else   // PY_VERSION_HEX >= 0x030C0000
+  PyEval_SetProfileAllThreads(nullptr, nullptr);
+#endif  // PY_VERSION_HEX >= 0x030C0000
 
   // And notify the threading library that we're done.
   ThreadingSetProfile(py::none());

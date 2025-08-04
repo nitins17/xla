@@ -15,7 +15,6 @@
 #include "xla/python/ifrt_proxy/client/grpc_client_session.h"
 
 #include <atomic>
-#include <deque>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -44,11 +43,13 @@
 #include "grpcpp/server_context.h"
 #include "grpcpp/support/status.h"
 #include "grpcpp/support/sync_stream.h"
+#include "xla/python/ifrt/serdes_version.h"
 #include "xla/python/ifrt_proxy/client/version.h"
 #include "xla/python/ifrt_proxy/common/grpc_credentials.h"
 #include "xla/python/ifrt_proxy/common/grpc_ifrt_service.grpc.pb.h"
 #include "xla/python/ifrt_proxy/common/grpc_ifrt_service.pb.h"
 #include "xla/python/ifrt_proxy/common/ifrt_service.pb.h"
+#include "xla/python/ifrt_proxy/common/test_utils.h"
 #include "tsl/platform/errors.h"
 #include "tsl/platform/logging.h"
 #include "tsl/platform/status_matchers.h"
@@ -64,9 +65,6 @@ namespace {
 using ::testing::Not;
 using ::tsl::testing::IsOk;
 
-constexpr int kOp1 = 1;
-constexpr int kOp2 = 2;
-
 // Sufficient time for all processing (that are not explicitly waiting for
 // further input) to have finished.
 constexpr absl::Duration kSufficientTime = absl::Seconds(5);
@@ -74,54 +72,15 @@ constexpr absl::Duration kSufficientTime = absl::Seconds(5);
 GrpcIfrtSessionMetadata Metadata() {
   GrpcIfrtSessionMetadata metadata;
   metadata.mutable_version()->set_protocol_version(kClientMaxVersion);
+  metadata.mutable_version()->set_ifrt_serdes_version_number(
+      SerDesVersion::current().version_number().value());
   return metadata;
 }
 
 absl::Status TestError() { return absl::UnknownError("test error"); }
 
-// A thread-safe queue of `absl::Status` values.
-class Queue {
- public:
-  void Push(absl::Status t) {
-    absl::MutexLock l(&mu_);
-    queue_.push_back(std::move(t));
-  }
-
-  std::optional<absl::Status> PopOrTimeout(
-      absl::Duration timeout = kSufficientTime) {
-    absl::MutexLock l(&mu_);
-    auto cond = [this]() ABSL_SHARED_LOCKS_REQUIRED(mu_) -> bool {
-      return !queue_.empty();
-    };
-    mu_.AwaitWithTimeout(absl::Condition(&cond), timeout);
-    if (queue_.empty()) {
-      return std::nullopt;
-    }
-    absl::Status result = std::move(queue_.front());
-    queue_.pop_front();
-    return result;
-  }
-
-  absl::Status Pop(absl::Duration timeout = kSufficientTime) {
-    auto result = PopOrTimeout(timeout);
-    CHECK(result.has_value()) << "Timeout!";
-    return *result;
-  }
-
-  void PopAllDuringDestruction() {
-    absl::MutexLock l(&mu_);
-    allow_non_empty_destruction_ = true;
-  }
-
-  ~Queue() {
-    absl::MutexLock l(&mu_);
-    if (!allow_non_empty_destruction_) CHECK(queue_.empty()) << " " << this;
-  }
-
- private:
-  absl::Mutex mu_;
-  std::deque<absl::Status> queue_ ABSL_GUARDED_BY(mu_);
-  bool allow_non_empty_destruction_ ABSL_GUARDED_BY(mu_) = false;
+struct Queue : public TestQueue<absl::Status> {
+  Queue() : TestQueue<absl::Status>(kSufficientTime) {}
 };
 
 // Checks that the input is a list of zero-or-more OK statuses followed by
@@ -145,7 +104,7 @@ void ExpectHeadAndTail(
   for (const auto& s : status_list) {
     if (!s.ok()) seen_not_ok = true;
     if (seen_not_ok) {
-      EXPECT_THAT(s, Not(IsOk())) << str;
+      EXPECT_THAT(s, Not(absl_testing::IsOk())) << str;
     }
   }
 }
@@ -252,7 +211,7 @@ class ClientAndServer {
           client_finished_notification_.Notify();
         });
 
-    client_finished_q_.PopAllDuringDestruction();
+    client_finished_q_.AllowNonEmptyDestruction(/*allow=*/true);
   }
 
   void StopServer() {
@@ -273,12 +232,11 @@ class ClientAndServer {
 
   Queue* client_finished_q() { return &client_finished_q_; }
 
-  absl::StatusOr<Queue*> SendSimpleRequest(int op_id) {
+  absl::StatusOr<Queue*> SendSimpleRequest() {
     owned_queues_.push_back(std::make_unique<Queue>());
     Queue* q = owned_queues_.back().get();
 
     auto req = std::make_unique<IfrtRequest>();
-    req->mutable_request_metadata()->set_op_id(op_id);
     TF_RETURN_IF_ERROR(client_session_->Enqueue(
         std::move(req), [q](absl::StatusOr<GrpcClientSession::Response> resp) {
           q->Push(resp.status());
@@ -300,56 +258,58 @@ class ClientAndServer {
 TEST(GrpcClientSessionTest, HappyCaseOneRequestWithServerTermination) {
   ClientAndServer cs;
 
-  TF_ASSERT_OK_AND_ASSIGN(Queue * response_q, cs.SendSimpleRequest(kOp1));
+  TF_ASSERT_OK_AND_ASSIGN(Queue * response_q, cs.SendSimpleRequest());
 
-  EXPECT_THAT(response_q->Pop(), IsOk());
+  EXPECT_THAT(response_q->Pop(), absl_testing::IsOk());
 
   EXPECT_EQ(cs.client_finished_q()->PopOrTimeout(), std::nullopt);
 
   cs.StopServer();
-  EXPECT_THAT(cs.client_finished_q()->Pop(), Not(IsOk()));
+  EXPECT_THAT(cs.client_finished_q()->Pop(), Not(absl_testing::IsOk()));
 }
 
 TEST(GrpcClientSessionTest, HappyCaseTwoRequestsWithClientFinish) {
   ClientAndServer cs;
 
-  TF_ASSERT_OK_AND_ASSIGN(Queue * response_q_1, cs.SendSimpleRequest(kOp1));
-  TF_ASSERT_OK_AND_ASSIGN(Queue * response_q_2, cs.SendSimpleRequest(kOp2));
+  TF_ASSERT_OK_AND_ASSIGN(Queue * response_q_1, cs.SendSimpleRequest());
+  TF_ASSERT_OK_AND_ASSIGN(Queue * response_q_2, cs.SendSimpleRequest());
 
-  EXPECT_THAT(response_q_1->Pop(), IsOk());
-  EXPECT_THAT(response_q_2->Pop(), IsOk());
+  EXPECT_THAT(response_q_1->Pop(), absl_testing::IsOk());
+  EXPECT_THAT(response_q_2->Pop(), absl_testing::IsOk());
 
   EXPECT_EQ(cs.client_finished_q()->PopOrTimeout(), std::nullopt);
 
   cs.client_session()->Finish(TestError());
-  EXPECT_THAT(cs.client_finished_q()->Pop(), Not(IsOk()));
+  EXPECT_THAT(cs.client_finished_q()->Pop(), Not(absl_testing::IsOk()));
 }
 
 TEST(GrpcClientSessionTest, ServerFinishesDuringFirstRead) {
   ClientAndServer cs(
       /*on_req_received=*/[](auto, auto) { return kStopSession; });
 
-  TF_ASSERT_OK_AND_ASSIGN(Queue * response_q_1, cs.SendSimpleRequest(kOp1));
-  EXPECT_THAT(response_q_1->Pop(), Not(IsOk()));
+  TF_ASSERT_OK_AND_ASSIGN(Queue * response_q_1, cs.SendSimpleRequest());
+  EXPECT_THAT(response_q_1->Pop(), Not(absl_testing::IsOk()));
 
-  absl::StatusOr<Queue*> response_q_2 = cs.SendSimpleRequest(kOp2);
-  EXPECT_THAT(response_q_2.status(), Not(IsOk()));
+  absl::StatusOr<Queue*> response_q_2 = cs.SendSimpleRequest();
+  EXPECT_THAT(response_q_2.status(), Not(absl_testing::IsOk()));
 
-  EXPECT_THAT(cs.client_finished_q()->Pop(), Not(IsOk()));
+  EXPECT_THAT(cs.client_finished_q()->Pop(), Not(absl_testing::IsOk()));
 }
 
 TEST(GrpcClientSessionTest, ServerFinishesDuringConstruction) {
   ClientAndServer cs(/*on_req_received=*/nullptr,
                      /*on_session_start=*/[]() { return kStopSession; });
 
-  absl::StatusOr<Queue*> response_q_1 = cs.SendSimpleRequest(kOp1);
-  absl::StatusOr<Queue*> response_q_2 = cs.SendSimpleRequest(kOp2);
+  absl::StatusOr<Queue*> response_q_1 = cs.SendSimpleRequest();
+  absl::StatusOr<Queue*> response_q_2 = cs.SendSimpleRequest();
 
   ExpectHeadAndTail({response_q_1, response_q_2});
-  if (response_q_1.ok()) EXPECT_THAT(response_q_1.value()->Pop(), Not(IsOk()));
-  if (response_q_2.ok()) EXPECT_THAT(response_q_2.value()->Pop(), Not(IsOk()));
+  if (response_q_1.ok())
+    EXPECT_THAT(response_q_1.value()->Pop(), Not(absl_testing::IsOk()));
+  if (response_q_2.ok())
+    EXPECT_THAT(response_q_2.value()->Pop(), Not(absl_testing::IsOk()));
 
-  EXPECT_THAT(cs.client_finished_q()->Pop(), Not(IsOk()));
+  EXPECT_THAT(cs.client_finished_q()->Pop(), Not(absl_testing::IsOk()));
 }
 
 TEST(GrpcClientSessionTest, ClientFinishesAfterServerConsumesFirstRequest) {
@@ -361,13 +321,13 @@ TEST(GrpcClientSessionTest, ClientFinishesAfterServerConsumesFirstRequest) {
       });
   session_ptr.store(cs.client_session());
 
-  TF_ASSERT_OK_AND_ASSIGN(Queue * response_q_1, cs.SendSimpleRequest(kOp1));
-  EXPECT_THAT(response_q_1->Pop(), Not(IsOk()));
+  TF_ASSERT_OK_AND_ASSIGN(Queue * response_q_1, cs.SendSimpleRequest());
+  EXPECT_THAT(response_q_1->Pop(), Not(absl_testing::IsOk()));
 
-  absl::StatusOr<Queue*> response_q_2 = cs.SendSimpleRequest(kOp2);
-  EXPECT_THAT(response_q_2.status(), Not(IsOk()));
+  absl::StatusOr<Queue*> response_q_2 = cs.SendSimpleRequest();
+  EXPECT_THAT(response_q_2.status(), Not(absl_testing::IsOk()));
 
-  EXPECT_THAT(cs.client_finished_q()->Pop(), Not(IsOk()));
+  EXPECT_THAT(cs.client_finished_q()->Pop(), Not(absl_testing::IsOk()));
 }
 
 TEST(GrpcClientSessionTest, ClientFinishesAfterServerWritesFirstResponse) {
@@ -384,8 +344,8 @@ TEST(GrpcClientSessionTest, ClientFinishesAfterServerWritesFirstResponse) {
       });
   session_ptr.store(cs.client_session());
 
-  TF_ASSERT_OK_AND_ASSIGN(Queue * response_q_1, cs.SendSimpleRequest(kOp1));
-  absl::StatusOr<Queue*> response_q_2 = cs.SendSimpleRequest(kOp2);
+  TF_ASSERT_OK_AND_ASSIGN(Queue * response_q_1, cs.SendSimpleRequest());
+  absl::StatusOr<Queue*> response_q_2 = cs.SendSimpleRequest();
 
   // The client may or may not terminate before the first response arrives.
   response_q_1->Pop().IgnoreError();
@@ -394,10 +354,10 @@ TEST(GrpcClientSessionTest, ClientFinishesAfterServerWritesFirstResponse) {
   // enqueued. If it could be enqueued, the client will die without the server
   // sending the corresponding response.
   if (response_q_2.ok()) {
-    EXPECT_THAT(response_q_2.value()->Pop(), Not(IsOk()));
+    EXPECT_THAT(response_q_2.value()->Pop(), Not(absl_testing::IsOk()));
   }
 
-  EXPECT_THAT(cs.client_finished_q()->Pop(), Not(IsOk()));
+  EXPECT_THAT(cs.client_finished_q()->Pop(), Not(absl_testing::IsOk()));
 }
 
 TEST(GrpcClientSessionTest, ClientFinishesDuringServerConstruction) {
@@ -413,37 +373,37 @@ TEST(GrpcClientSessionTest, ClientFinishesDuringServerConstruction) {
   session_ptr.store(cs.client_session());
   init_done.Notify();
 
-  absl::StatusOr<Queue*> response_q_1 = cs.SendSimpleRequest(kOp1);
-  absl::StatusOr<Queue*> response_q_2 = cs.SendSimpleRequest(kOp2);
+  absl::StatusOr<Queue*> response_q_1 = cs.SendSimpleRequest();
+  absl::StatusOr<Queue*> response_q_2 = cs.SendSimpleRequest();
 
   if (response_q_1.ok()) {
-    EXPECT_THAT(response_q_1.value()->Pop(), Not(IsOk()));
+    EXPECT_THAT(response_q_1.value()->Pop(), Not(absl_testing::IsOk()));
   }
   if (response_q_2.ok()) {
-    EXPECT_THAT(response_q_2.value()->Pop(), Not(IsOk()));
+    EXPECT_THAT(response_q_2.value()->Pop(), Not(absl_testing::IsOk()));
   }
 
   ExpectHeadAndTail({response_q_1, response_q_2});
 
-  EXPECT_THAT(cs.client_finished_q()->Pop(), Not(IsOk()));
+  EXPECT_THAT(cs.client_finished_q()->Pop(), Not(absl_testing::IsOk()));
 }
 
 TEST(GrpcClientSessionTest, MethodsAfterFinishReturnError) {
   ClientAndServer cs;
 
-  TF_ASSERT_OK_AND_ASSIGN(Queue * response_q_1, cs.SendSimpleRequest(kOp1));
+  TF_ASSERT_OK_AND_ASSIGN(Queue * response_q_1, cs.SendSimpleRequest());
   cs.client_session()->Finish(TestError());
 
-  EXPECT_THAT(cs.SendSimpleRequest(kOp2), Not(IsOk()));
+  EXPECT_THAT(cs.SendSimpleRequest(), Not(absl_testing::IsOk()));
 
-  response_q_1->PopAllDuringDestruction();
+  response_q_1->AllowNonEmptyDestruction(/*allow=*/true);
 }
 
 TEST(GrpcClientSessionTest, ReceivingBadIfrtResponseDoesNotCrash) {
   ClientAndServer cs(
       /*on_req_received=*/[](const IfrtRequest& r, ServerStream* s) mutable {
         IfrtResponse resp;
-        resp.mutable_response_metadata()->set_op_id(kOp2);
+        resp.mutable_response_metadata()->set_op_id(2000);
         s->Write(resp);
         resp.mutable_response_metadata()->set_op_id(
             r.request_metadata().op_id());
@@ -451,9 +411,9 @@ TEST(GrpcClientSessionTest, ReceivingBadIfrtResponseDoesNotCrash) {
         return kContinueSession;
       });
 
-  TF_ASSERT_OK_AND_ASSIGN(Queue * response_q, cs.SendSimpleRequest(kOp1));
+  TF_ASSERT_OK_AND_ASSIGN(Queue * response_q, cs.SendSimpleRequest());
 
-  EXPECT_THAT(response_q->Pop(), IsOk());
+  EXPECT_THAT(response_q->Pop(), absl_testing::IsOk());
 }
 
 TEST(GrpcClientSessionTest, BadInitialChannelFailsPromptly) {
@@ -472,7 +432,7 @@ TEST(GrpcClientSessionTest, BadInitialChannelFailsPromptly) {
       std::move(stub), Metadata(),
       [session_finished](absl::Status s) { session_finished->Push(s); });
 
-  EXPECT_THAT(session_finished->Pop(), Not(IsOk()));
+  EXPECT_THAT(session_finished->Pop(), Not(absl_testing::IsOk()));
 }
 
 }  // namespace

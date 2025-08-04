@@ -18,7 +18,10 @@ limitations under the License.
 #include <cstdint>
 #include <utility>
 
+#include "absl/log/check.h"
+#include "absl/log/log.h"
 #include "absl/status/status.h"
+#include "absl/status/statusor.h"
 #include "absl/strings/str_format.h"
 #include "absl/synchronization/mutex.h"
 #include "absl/types/span.h"
@@ -105,7 +108,7 @@ absl::StatusOr<Stream*> StreamExecutorMemoryAllocator::GetStream(
   if (!streams_.count(device_ordinal)) {
     TF_ASSIGN_OR_RETURN(auto stream, executor->CreateStream());
     auto stream_ptr = stream.get();
-    stream_ptr->set_name("StreamExecutorMemoryAllocator");
+    stream_ptr->SetName("StreamExecutorMemoryAllocator");
     streams_.emplace(device_ordinal, std::move(stream));
     return stream_ptr;
   }

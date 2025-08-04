@@ -612,7 +612,7 @@ class ScalarPointwiseToStandardConverter : public OpConversionPattern<MhloOp> {
     auto rhs = rewriter.create<memref::LoadOp>(loc, mhloOp.rhs());
     Value opResult = mhlo::MhloOpToStdScalarOp::mapOp(
         mhloOp, argType.getElementType(), llvm::ArrayRef<Value>{lhs, rhs},
-        &rewriter);
+        /*attributes=*/std::nullopt, &rewriter);
     rewriter.create<memref::StoreOp>(loc, opResult, mhloOp.out());
     rewriter.eraseOp(mhloOp);
     return success();
@@ -1512,7 +1512,7 @@ class IotaConverter : public OpConversionPattern<OpTy> {
               indexOp);
           castOp = mhlo::MhloOpToStdScalarOp::mapConvertOpToStdScalarOp(
               nestedLoc, targetElementType, resultElementType, castOp.getType(),
-              {castOp}, &nestedBuilder);
+              {castOp}, /*attributes=*/{}, &nestedBuilder);
           nestedBuilder.create<linalg::YieldOp>(nestedLoc, castOp);
         },
         linalg::getPrunedAttributeList(iotaOp));
@@ -1548,7 +1548,8 @@ class IotaToMapConverter : public OpConversionPattern<OpTy> {
               nestedLoc, nestedBuilder.getI64Type(), index);
           Value result = mhlo::MhloOpToStdScalarOp::mapConvertOpToStdScalarOp(
               nestedLoc, targetElementType, resultTy.getElementType(),
-              index.getType(), {ValueRange{index}}, &nestedBuilder);
+              index.getType(), {ValueRange{index}}, /*attributes=*/{},
+              &nestedBuilder);
           nestedBuilder.create<linalg::YieldOp>(nestedLoc, ValueRange{result});
         },
         linalg::getPrunedAttributeList(iotaOp));
@@ -3289,8 +3290,9 @@ struct ConvolutionOpGeneralConversion
                 /*bodyBuild=*/
                 [&](OpBuilder& nestedBuilder, Location nestedLoc, ValueRange) {
                   ImplicitLocOpBuilder builder(nestedLoc, nestedBuilder);
-                  linalg::Conv2DOp::regionBuilder(
-                      builder, *builder.getInsertionBlock(), {});
+                  linalg::Conv2DOp::regionBuilder(builder,
+                                                  *builder.getInsertionBlock(),
+                                                  {}, /*emitError=*/{});
                 },
                 linalg::getPrunedAttributeList(op))
             .getResult(0);
@@ -4296,7 +4298,8 @@ class DotGeneralOpConversion : public OpConversionPattern<mhlo::DotGeneralOp> {
             /*nReduction=*/numContracting),
         [](OpBuilder& b, Location loc, ValueRange) {
           ImplicitLocOpBuilder builder(loc, b);
-          linalg::MatmulOp::regionBuilder(builder, *b.getInsertionBlock(), {});
+          linalg::MatmulOp::regionBuilder(builder, *b.getInsertionBlock(), {},
+                                          /*emitError=*/{});
         },
         linalg::getPrunedAttributeList(op));
 
@@ -4369,7 +4372,8 @@ class PointwiseToLinalgMapConverter : public OpConversionPattern<OpTy> {
         [&](OpBuilder& b, Location loc, ValueRange args) {
           Value innerResult = mhlo::MhloOpToStdScalarOp::mapOp(
               op, getElementTypeOrSelf(emptyTensor),
-              interleaveScalarAndBlockArgs(scalarInputs, args), &b);
+              interleaveScalarAndBlockArgs(scalarInputs, args),
+              /*attributes=*/{}, &b);
           b.create<linalg::YieldOp>(loc, innerResult);
         },
         linalg::getPrunedAttributeList(op));

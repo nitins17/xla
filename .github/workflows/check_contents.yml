@@ -19,9 +19,13 @@
 # files once XLA moves out of Tensorflow internally.
 # TODO(ddunleavy): Update this after METADATA files are consolidated.
 name: Check Contents
-permissions: read-all
+permissions:
+  contents: read
 on:
   pull_request:
+  push:
+    branches:
+      - main
 
 env:
   # A bit tricky here: this lets us invoke python files outside of `bazel run`
@@ -36,13 +40,13 @@ jobs:
     defaults:
       run:
         shell: bash
-    timeout-minutes: 1
+    timeout-minutes: 6
     if: |
       github.event.sender.type == 'User' ||
       contains(github.event.pull_request.body, 'FORCE_TEST_ACTIONS')
     steps:
       - name: "Checking out repository"
-        uses: actions/checkout@e2f20e631ae6d7dd3b768f56a5d2af784dd54791 # v2.5.0
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - name: "Fetch HEAD of main branch"
         run: git fetch origin main --depth=1
 

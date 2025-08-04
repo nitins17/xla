@@ -22,8 +22,8 @@ limitations under the License.
 #include <gtest/gtest.h>
 #include "xla/parse_flags_from_env.h"
 #include "xla/service/compilation_environments.h"
+#include "xla/tsl/lib/core/status_test_util.h"
 #include "xla/xla.pb.h"
-#include "tsl/lib/core/status_test_util.h"
 #include "tsl/platform/env.h"
 #include "tsl/platform/errors.h"
 #include "tsl/platform/status_matchers.h"
@@ -64,7 +64,7 @@ TEST(CreateGpuCompEnvFromFlagStringsTest, InvalidFlagName) {
   std::vector<std::string> flags = {"--xla_gpu_invalid_flag=2"};
 
   EXPECT_THAT(CreateGpuCompEnvFromFlagStrings(flags, /*strict=*/true),
-              StatusIs(tsl::error::INVALID_ARGUMENT));
+              absl_testing::StatusIs(tsl::error::INVALID_ARGUMENT));
 
   TF_ASSERT_OK_AND_ASSIGN(
       GpuCompilationEnvironment gpu_comp_env,
@@ -125,7 +125,7 @@ TEST(InitializeMissingFieldsFromXLAFlagsTest,
   GpuCompilationEnvironment env;
   env.set_dummy_flag(2);
   EXPECT_THAT(InitializeMissingFieldsFromXLAFlags(env),
-              StatusIs(tsl::error::INVALID_ARGUMENT));
+              absl_testing::StatusIs(tsl::error::INVALID_ARGUMENT));
 }
 
 }  // namespace

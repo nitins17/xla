@@ -1,7 +1,11 @@
 load("@bazel_skylib//:bzl_library.bzl", "bzl_library")
 load("@bazel_skylib//rules:common_settings.bzl", "bool_flag")
-load("@tsl//tsl/platform:rules_cc.bzl", "cc_library")
 load("//xla/tsl:tsl.default.bzl", "get_compatible_with_portable")
+load(
+    "//xla/tsl/platform:build_config.bzl",
+    "tsl_cc_test",
+)
+load("//xla/tsl/platform:rules_cc.bzl", "cc_library")
 
 package(
     # copybara:uncomment default_applicable_licenses = ["//tensorflow:license"],
@@ -30,6 +34,10 @@ config_setting(
 bzl_library(
     name = "build_defs",
     srcs = ["build_defs.bzl"],
+    deps = [
+        # copybara:uncomment "@rules_cc//cc:core_rules",
+        "//xla/tsl:package_groups_bzl",
+    ],
 )
 
 # Add
@@ -104,9 +112,9 @@ cc_library(
     }),
     deps = [
         "//xla/tsl/framework/fixedpoint",
+        "//xla/tsl/platform:dynamic_annotations",
         "@com_google_absl//absl/base",
         "@eigen_archive//:eigen3",
-        "@tsl//tsl/platform:dynamic_annotations",
     ] + select({
         ":disable_onednn_contraction_kernel_config": [],
         "//xla/tsl:android_x86": [],
@@ -141,9 +149,20 @@ cc_library(
     # ],
     deps = [
         "//xla/tsl/framework/fixedpoint",
+        "//xla/tsl/platform:dynamic_annotations",
         "@com_google_absl//absl/base",
         "@eigen_archive//:eigen3",
-        "@tsl//tsl/platform:dynamic_annotations",
+    ],
+)
+
+tsl_cc_test(
+    name = "eigen_contraction_kernel_test",
+    srcs = ["eigen_contraction_kernel_test.cc"],
+    deps = [
+        ":eigen_contraction_kernel",
+        "@com_google_absl//absl/strings",
+        "@com_google_googletest//:gtest_main",
+        "@eigen_archive//:eigen3",
     ],
 )
 

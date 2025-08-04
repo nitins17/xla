@@ -16,8 +16,11 @@ limitations under the License.
 #include "xla/service/while_loop_simplifier.h"
 
 #include <cstdint>
+#include <iterator>
+#include <memory>
 #include <optional>
 #include <utility>
+#include <vector>
 
 #include "absl/algorithm/container.h"
 #include "absl/container/flat_hash_map.h"
@@ -28,22 +31,25 @@ limitations under the License.
 #include "absl/strings/string_view.h"
 #include "absl/types/span.h"
 #include "xla/comparison_util.h"
+#include "xla/hlo/analysis/while_loop_analysis.h"
 #include "xla/hlo/ir/hlo_casting_utils.h"
 #include "xla/hlo/ir/hlo_computation.h"
 #include "xla/hlo/ir/hlo_instruction.h"
 #include "xla/hlo/ir/hlo_instructions.h"
 #include "xla/hlo/ir/hlo_opcode.h"
+#include "xla/hlo/ir/hlo_print_options.h"
+#include "xla/hlo/transforms/simplifiers/hlo_dce.h"
 #include "xla/hlo/utils/hlo_query.h"
 #include "xla/literal_util.h"
 #include "xla/primitive_util.h"
 #include "xla/service/call_inliner.h"
 #include "xla/service/hlo_creation_utils.h"
-#include "xla/service/hlo_dce.h"
 #include "xla/service/pattern_matcher.h"
-#include "xla/service/while_loop_analysis.h"
 #include "xla/shape.h"
 #include "xla/shape_util.h"
 #include "xla/status_macros.h"
+#include "xla/tsl/platform/errors.h"
+#include "xla/tsl/platform/statusor.h"
 #include "xla/union_find.h"
 #include "xla/util.h"
 #include "xla/xla_data.pb.h"
@@ -244,16 +250,16 @@ static absl::StatusOr<HloInstruction*> RemoveDeadTupleIndices(
   std::unique_ptr<HloComputation> new_while_body =
       while_body->CloneWithReplacements(&while_body_replacements);
 
-  // Add a new while_init instruction that repackages the old while_init
-  // instruction's elements.  We rely on the AlgebraicSimplifier and DCE to
-  // clean this up in the common case where while_init is a tuple op.  (It's
-  // definitely tuple-shaped, but it's not necessarily a tuple op.)
   std::vector<HloInstruction*> new_while_init_elems;
   new_while_init_elems.reserve(new_to_old_tuple_idx.size());
   for (int64_t old_idx : new_to_old_tuple_idx) {
-    new_while_init_elems.push_back(
-        computation->AddInstruction(HloInstruction::CreateGetTupleElement(
-            while_init->shape().tuple_shapes(old_idx), while_init, old_idx)));
+    if (while_init->opcode() == HloOpcode::kTuple) {
+      new_while_init_elems.push_back(while_init->mutable_operand(old_idx));
+    } else {
+      new_while_init_elems.push_back(
+          computation->AddInstruction(HloInstruction::CreateGetTupleElement(
+              while_init->shape().tuple_shapes(old_idx), while_init, old_idx)));
+    }
   }
   auto* new_while_init = computation->AddInstruction(
       HloInstruction::CreateTuple(new_while_init_elems));
@@ -311,6 +317,30 @@ static absl::StatusOr<HloInstruction*> RemoveDeadTupleIndices(
   return new_while_op;
 }
 
+namespace {
+
+bool AllWhileParamConsumersGte(const HloInstruction* while_op) {
+  HloComputation* while_cond = while_op->while_condition();
+  HloComputation* while_body = while_op->while_body();
+
+  for (const HloInstruction* instr : {while_body->parameter_instruction(0),
+                                      while_cond->parameter_instruction(0)}) {
+    for (const HloInstruction* user : instr->users()) {
+      if (user->opcode() != HloOpcode::kGetTupleElement) {
+        VLOG(2) << "Cowardly refusing to analyze while loop with "
+                << instr->ToString(HloPrintOptions().set_print_metadata(false))
+                << " used by non-GTE instruction "
+                << user->ToString(HloPrintOptions().set_print_metadata(false))
+                << " in computation " << instr->parent()->name();
+        return false;
+      }
+    }
+  }
+  return true;
+}
+
+}  // namespace
+
 absl::StatusOr<bool> TryRemoveDeadWhileParams(HloInstruction* while_op) {
   CHECK_EQ(while_op->opcode(), HloOpcode::kWhile);
 
@@ -348,18 +378,8 @@ absl::StatusOr<bool> TryRemoveDeadWhileParams(HloInstruction* while_op) {
 
   // Bail if param0 of while_cond or while_body has users which aren't of type
   // get-tuple-element.
-  for (const HloInstruction* instr : {while_body->parameter_instruction(0),
-                                      while_cond->parameter_instruction(0)}) {
-    for (const HloInstruction* user : instr->users()) {
-      if (user->opcode() != HloOpcode::kGetTupleElement) {
-        VLOG(2) << "Cowardly refusing to analyze while loop with "
-                << instr->ToString(print_no_metadata)
-                << " used by non-GTE instruction "
-                << user->ToString(print_no_metadata) << " in computation "
-                << instr->parent()->name();
-        return false;
-      }
-    }
+  if (!AllWhileParamConsumersGte(while_op)) {
+    return false;
   }
 
   if (tuple_size == 0) {
@@ -437,7 +457,7 @@ absl::StatusOr<bool> TryRemoveDeadWhileParams(HloInstruction* while_op) {
   absl::flat_hash_map<HloInstruction*, InputIndicesSet> inst_input_deps;
   // Find disjoint sets of connected instruction groups. This helps finding a
   // group of inter-dependent indices that can be removed together. For case 2).
-  absl::flat_hash_map<HloInstruction*, tensorflow::UnionFind<HloInstruction*>>
+  absl::flat_hash_map<HloInstruction*, UnionFind<HloInstruction*>>
       disjoint_sets;
   // Initialize.
   for (HloComputation* comp : {while_body, while_cond}) {
@@ -591,7 +611,7 @@ static absl::StatusOr<HloInstruction*> TryRemoveRepeatedWhileTupleIndicesHelper(
 
   // We know which tuple indices are useful; i.e, those which aren't duplicates.
   absl::flat_hash_set<int64_t> used_tuple_indices;
-  for (int index = 0; index < while_init->shape().tuple_shapes_size();
+  for (int index = 0; index < while_init->shape().tuple_shapes().size();
        ++index) {
     if (!duplicates.count(index)) {
       used_tuple_indices.insert(index);
@@ -639,8 +659,12 @@ static absl::StatusOr<bool> TryRemoveRepeatedWhileTupleIndices(
     return false;
   }
 
+  if (!AllWhileParamConsumersGte(while_op)) {
+    return false;
+  }
+
   bool changed = false;
-  while (index_to_investigate < while_init->shape().tuple_shapes_size()) {
+  while (index_to_investigate < while_init->shape().tuple_shapes().size()) {
     if (!while_init->shape().IsTuple() ||
         while_init->opcode() != HloOpcode::kTuple) {
       VLOG(2) << "While op's carried value isn't tuple shaped.";
@@ -685,7 +709,7 @@ static absl::StatusOr<bool> TryRemoveRepeatedWhileTupleIndices(
 
     // Look from index_to_investigate onwards to see if it is repeated.
     for (int64_t i = index_to_investigate + 1;
-         i < while_shape.tuple_shapes_size(); ++i) {
+         i < while_shape.tuple_shapes().size(); ++i) {
       auto* init_elem = while_init->operand(i);
       auto* body_elem = while_body_root->operand(i);
       if (pivot_body_elem->opcode() == HloOpcode::kGetTupleElement &&
@@ -707,7 +731,7 @@ static absl::StatusOr<bool> TryRemoveRepeatedWhileTupleIndices(
         }
         if (body_elem->operand(0)->tuple_index() != i) {
           VLOG(2) << "Mismatch between body_elem->operand(0)->tuple_index() "
-                  << body_elem->tuple_index() << " i " << i;
+                  << body_elem->operand(0)->tuple_index() << " i " << i;
           continue;
         }
         if (pivot_body_elem->operand(0) == body_elem->operand(0)) {
@@ -783,7 +807,7 @@ static absl::StatusOr<bool> TryRemoveConstantParams(HloInstruction* while_op) {
 
   absl::flat_hash_set<int64_t> constant_tuple_indices;
   const auto& while_shape = while_init->shape();
-  for (int i = 0; i < while_shape.tuple_shapes_size(); ++i) {
+  for (int i = 0; i < while_shape.tuple_shapes().size(); ++i) {
     auto* init_elem = while_init->operand(i);
     auto* body_elem = while_body_root->operand(i);
     if (init_elem->opcode() == HloOpcode::kConstant &&
@@ -800,7 +824,7 @@ static absl::StatusOr<bool> TryRemoveConstantParams(HloInstruction* while_op) {
   // OK, we found some constant elements of the while parameter!  Eliminate
   // them.
   std::vector<const Shape*> new_while_shape_elems;
-  for (int i = 0; i < while_shape.tuple_shapes_size(); ++i) {
+  for (int i = 0; i < while_shape.tuple_shapes().size(); ++i) {
     if (!constant_tuple_indices.count(i)) {
       new_while_shape_elems.push_back(&while_shape.tuple_shapes(i));
     }
@@ -822,7 +846,7 @@ static absl::StatusOr<bool> TryRemoveConstantParams(HloInstruction* while_op) {
     CHECK(ShapeUtil::Compatible(instr->shape(), while_shape));
 
     std::vector<HloInstruction*> tuple_elems;
-    for (int i = 0; i < while_shape.tuple_shapes_size(); ++i) {
+    for (int i = 0; i < while_shape.tuple_shapes().size(); ++i) {
       if (!constant_tuple_indices.count(i)) {
         tuple_elems.push_back(
             add_new_instr(HloInstruction::CreateGetTupleElement(
@@ -837,7 +861,7 @@ static absl::StatusOr<bool> TryRemoveConstantParams(HloInstruction* while_op) {
 
     std::vector<HloInstruction*> tuple_elems;
     int64_t j = 0;
-    for (int i = 0; i < while_shape.tuple_shapes_size(); ++i) {
+    for (int i = 0; i < while_shape.tuple_shapes().size(); ++i) {
       if (constant_tuple_indices.count(i)) {
         tuple_elems.push_back(while_init->mutable_operand(i));
       } else {
@@ -954,8 +978,8 @@ static absl::StatusOr<bool> TryRemoveWhileLoop(HloInstruction* while_op) {
   // inline the call.
   const auto& attrs = while_op->frontend_attributes().map();
   bool skip_trip_count_one_simplification =
-      attrs.contains("skip-simplify-while-loops/trip-count-one") &&
-      (attrs.at("skip-simplify-while-loops/trip-count-one") == "true");
+      attrs.contains("skip-simplify-while-loops_trip-count-one") &&
+      (attrs.at("skip-simplify-while-loops_trip-count-one") == "true");
   if (trip_count && *trip_count == 1 && !skip_trip_count_one_simplification) {
     // Do not simplify the loop away when there is a side-effectful op,
     // otherwise the infeed op may not inherit the data dependency from
@@ -1085,7 +1109,7 @@ static std::unique_ptr<HloInstruction> UnflattenTupleInstr(
   // elements from `instrs` so that it only contains instructions we have not
   // yet processed.
   std::vector<HloInstruction*> elems;
-  for (int i = 0; i < desired_shape.tuple_shapes_size(); ++i) {
+  for (int i = 0; i < desired_shape.tuple_shapes().size(); ++i) {
     const Shape& subshape = desired_shape.tuple_shapes(i);
     if (!subshape.IsTuple()) {
       elems.push_back(instrs[0]);
@@ -1123,7 +1147,7 @@ static std::vector<HloInstruction*> GetFlatTupleElems(
     return {instr};
   }
   std::vector<HloInstruction*> elems;
-  for (int i = 0; i < shape.tuple_shapes_size(); ++i) {
+  for (int i = 0; i < shape.tuple_shapes().size(); ++i) {
     const Shape& subshape = shape.tuple_shapes(i);
     new_instrs->push_back(
         HloInstruction::CreateGetTupleElement(subshape, instr, i));
@@ -1178,8 +1202,8 @@ static absl::StatusOr<bool> TryFlattenNestedTuples(HloInstruction* while_op) {
   auto nested = [&](HloInstruction* instr) {
     std::vector<HloInstruction*> gtes;
     const Shape& flat_shape = instr->shape();
-    gtes.reserve(flat_shape.tuple_shapes_size());
-    for (int i = 0; i < flat_shape.tuple_shapes_size(); ++i) {
+    gtes.reserve(flat_shape.tuple_shapes().size());
+    for (int i = 0; i < flat_shape.tuple_shapes().size(); ++i) {
       gtes.push_back(add_new_instr(HloInstruction::CreateGetTupleElement(
           flat_shape.tuple_shapes(i), instr, i)));
     }
@@ -1356,7 +1380,7 @@ static absl::StatusOr<HloInstruction*> TryMergeInductionVariables(
   bool added_trip_counter = false;
   if (!trip_counter) {
     VLOG(10) << "Adding new trip counter to end of loop's tuple.";
-    trip_counter = new_while_shape.tuple_shapes_size();
+    trip_counter = new_while_shape.tuple_shapes().size();
     *new_while_shape.add_tuple_shapes() =
         ShapeUtil::MakeShape(elem_ty, /*dimensions=*/{});
     added_trip_counter = true;
@@ -1368,7 +1392,7 @@ static absl::StatusOr<HloInstruction*> TryMergeInductionVariables(
   auto convert_to_old_form = [&](HloInstruction* instr) {
     CHECK(ShapeUtil::Compatible(instr->shape(), new_while_shape));
     std::vector<HloInstruction*> tuple_elems;
-    for (int i = 0; i < while_shape.tuple_shapes_size(); ++i) {
+    for (int i = 0; i < while_shape.tuple_shapes().size(); ++i) {
       const auto& elem_shape = while_shape.tuple_shapes(i);
       if (!induction_vars.count(i)) {
         tuple_elems.push_back(add_gte(instr, i));
@@ -1394,8 +1418,8 @@ static absl::StatusOr<HloInstruction*> TryMergeInductionVariables(
     // In the new form, induction variables come from `init`, everything else
     // (including the trip counter if it's not one we created ourselves) comes
     // from the `root` tuple unmodified.
-    tuple_elems.reserve(while_shape.tuple_shapes_size());
-    for (int i = 0; i < while_shape.tuple_shapes_size(); ++i) {
+    tuple_elems.reserve(while_shape.tuple_shapes().size());
+    for (int i = 0; i < while_shape.tuple_shapes().size(); ++i) {
       tuple_elems.push_back(
           add_gte((induction_vars.count(i) ? loop_body_param : old_root), i));
     }
@@ -1420,8 +1444,8 @@ static absl::StatusOr<HloInstruction*> TryMergeInductionVariables(
       return init;
     }
     std::vector<HloInstruction*> tuple_elems;
-    tuple_elems.reserve(while_shape.tuple_shapes_size());
-    for (int i = 0; i < while_shape.tuple_shapes_size(); ++i) {
+    tuple_elems.reserve(while_shape.tuple_shapes().size());
+    for (int i = 0; i < while_shape.tuple_shapes().size(); ++i) {
       tuple_elems.push_back(add_gte(init, i));
     }
     tuple_elems.push_back(add_new_instr(
@@ -1502,6 +1526,15 @@ absl::StatusOr<bool> WhileLoopSimplifier::Run(
   }
 
   for (HloInstruction* while_op : while_ops) {
+    // TODO(b/260601110) : Bail if any of the computations the while_op uses are
+    // used by something else.  In theory, we could handle this case more
+    // cleanly, but that'd require restructuring the pass, and there's no need
+    // to do it right now, so just add a bail-out to be conservative.
+    if (while_op->while_body()->caller_instructions().size() > 1 ||
+        while_op->while_condition()->caller_instructions().size() > 1) {
+      continue;
+    }
+
     // Each of the optimizations below modifies the while loop itself if it's
     // successful, meaning that `while_op` is no longer valid after one of these
     // transformations returns true.
@@ -1594,9 +1627,10 @@ absl::StatusOr<bool> WhileLoopSimplifier::Run(
       continue;
     }
   }
-  HloDCE dce;
-  TF_ASSIGN_OR_RETURN(bool dce_changed, dce.Run(module));
-  changed |= dce_changed;
+  if (changed) {
+    HloDCE dce;
+    TF_RETURN_IF_ERROR(dce.Run(module).status());
+  }
   XLA_VLOG_LINES(3,
                  "WhileLoopSimplifier::Run(), after:\n" + module->ToString());
   return changed;
